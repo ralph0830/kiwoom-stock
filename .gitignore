@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 수집된 종목 데이터
+stock_data/
+
+# Playwright 관련
+.playwright-mcp/
+
+# 자동매매 로그 및 기록 파일
+auto_trading.log
+daily_trading_lock.json
+trading_results/
