@@ -75,6 +75,7 @@ KIWOOM_MOCK_SECRET_KEY=your_mock_secret_key
 # 자동매매 설정
 ACCOUNT_NO=12345678-01       # 계좌번호
 MAX_INVESTMENT=2000000       # 최대 투자금액 (원)
+TARGET_PROFIT_RATE=1.0       # 목표 수익률 (%) - 기본값: 1.0%
 
 # 서버 설정 (사용하지 않음 - unused)
 SERVER_HOST=0.0.0.0
@@ -133,11 +134,11 @@ stock/
 **주요 속성**:
 ```python
 self.buy_info = {
-    "stock_code": None,           # 종목코드
-    "stock_name": None,           # 종목명
-    "buy_price": 0,               # 매수가
-    "quantity": 0,                # 매수 수량
-    "target_profit_rate": 0.01    # 목표 수익률 (1%)
+    "stock_code": None,                                    # 종목코드
+    "stock_name": None,                                    # 종목명
+    "buy_price": 0,                                        # 매수가
+    "quantity": 0,                                         # 매수 수량
+    "target_profit_rate": 0.01                             # 목표 수익률 (환경변수 TARGET_PROFIT_RATE에서 로드, 기본값: 1%)
 }
 ```
 
@@ -252,7 +253,7 @@ WebSocket을 통한 실시간 시세 수신 및 연결 관리
 - 일일 1회만 매수 (날짜 기준)
 
 **매도**:
-- 목표 수익률: 1% (설정 가능)
+- 목표 수익률: 환경변수 `TARGET_PROFIT_RATE`로 설정 (기본값: 1.0%)
 - 매도 방식: 지정가 (목표가에서 한 틱 아래)
 - 중복 매도 방지: `sell_executed` 플래그
 

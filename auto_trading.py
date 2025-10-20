@@ -55,13 +55,17 @@ class AutoTradingSystem:
         self.sell_executed = False  # 매도 실행 플래그 (중복 방지)
         self.sell_monitoring = False
 
+        # 목표 수익률 환경변수에서 읽기 (기본값: 1.0%)
+        target_profit_rate_percent = float(os.getenv("TARGET_PROFIT_RATE", "1.0"))
+        target_profit_rate = target_profit_rate_percent / 100  # 퍼센트를 소수로 변환
+
         # 매수 정보 저장
         self.buy_info = {
             "stock_code": None,
             "stock_name": None,
             "buy_price": 0,
             "quantity": 0,
-            "target_profit_rate": 0.01  # 1% 수익률 (테스트용)
+            "target_profit_rate": target_profit_rate  # 환경변수에서 읽어온 목표 수익률
         }
 
         # 키움 API 초기화
@@ -193,6 +197,7 @@ class AutoTradingSystem:
         logger.info("🚀 자동매매 시스템 시작...")
         logger.info(f"계좌번호: {self.account_no}")
         logger.info(f"최대 투자금액: {self.max_investment:,}원")
+        logger.info(f"🎯 목표 수익률: {self.buy_info['target_profit_rate']*100:.2f}%")
 
         # 실제 계좌에 보유 종목이 있는지 확인
         trading_info = self.load_today_trading_info()
