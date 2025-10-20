@@ -61,7 +61,7 @@ class AutoTradingSystem:
             "stock_name": None,
             "buy_price": 0,
             "quantity": 0,
-            "target_profit_rate": 0.02  # 2% 수익률
+            "target_profit_rate": 0.01  # 1% 수익률 (테스트용)
         }
 
         # 키움 API 초기화
@@ -77,6 +77,11 @@ class AutoTradingSystem:
 
         # 하루 1회 매수 제한 파일
         self.trading_lock_file = Path("./daily_trading_lock.json")
+
+        # DEBUG 모드 설정 (환경변수에서 읽기)
+        self.debug_mode = os.getenv("DEBUG", "false").lower() == "true"
+        if self.debug_mode:
+            logger.info("🐛 DEBUG 모드 활성화: 실시간 시세를 계속 출력합니다")
 
     def check_today_trading_done(self) -> bool:
         """
@@ -136,23 +141,51 @@ class AutoTradingSystem:
             logger.error(f"매수 기록 저장 중 오류: {e}")
 
     def load_today_trading_info(self) -> dict | None:
-        """오늘 매수 정보 로드"""
-        if not self.trading_lock_file.exists():
-            return None
+        """
+        오늘 매수 정보 로드 (실제 계좌 잔고 조회)
 
+        Returns:
+            실제 계좌의 보유 종목 정보 또는 None
+        """
         try:
-            with open(self.trading_lock_file, 'r', encoding='utf-8') as f:
-                lock_data = json.load(f)
+            # 실제 계좌 잔고 조회
+            logger.info("📊 실제 계좌 잔고 조회 중...")
+            balance_result = self.kiwoom_api.get_account_balance()
 
-            last_trading_date = lock_data.get("last_trading_date")
-            today = datetime.now().strftime("%Y%m%d")
+            if not balance_result.get("success"):
+                logger.warning("⚠️ 계좌 잔고 조회 실패")
+                return None
 
-            if last_trading_date == today:
-                return lock_data
+            holdings = balance_result.get("holdings", [])
 
-            return None
+            if not holdings:
+                logger.info("ℹ️ 보유 종목이 없습니다.")
+                return None
+
+            # 첫 번째 보유 종목 반환 (자동매매 시스템은 1종목만 관리)
+            first_holding = holdings[0]
+
+            trading_info = {
+                "stock_code": first_holding.get("stk_cd", ""),
+                "stock_name": first_holding.get("stk_nm", ""),
+                "buy_price": int(first_holding.get("buy_uv", 0)),
+                "quantity": int(first_holding.get("rmnd_qty", 0)),  # 보유수량 (rmnd_qty)
+                "current_price": int(first_holding.get("cur_prc", 0))  # 현재가 (cur_prc)
+            }
+
+            logger.info("=" * 60)
+            logger.info("📥 실제 계좌 보유 종목 확인")
+            logger.info(f"종목명: {trading_info['stock_name']}")
+            logger.info(f"종목코드: {trading_info['stock_code']}")
+            logger.info(f"매입단가: {trading_info['buy_price']:,}원")
+            logger.info(f"보유수량: {trading_info['quantity']}주")
+            logger.info(f"현재가: {trading_info['current_price']:,}원")
+            logger.info("=" * 60)
+
+            return trading_info
+
         except Exception as e:
-            logger.error(f"매수 정보 로드 중 오류: {e}")
+            logger.error(f"❌ 계좌 정보 조회 중 오류: {e}")
             return None
 
     async def start_browser(self):
@@ -161,10 +194,11 @@ class AutoTradingSystem:
         logger.info(f"계좌번호: {self.account_no}")
         logger.info(f"최대 투자금액: {self.max_investment:,}원")
 
-        # 오늘 이미 매수했는지 확인
-        if self.check_today_trading_done():
-            logger.info("🚫 오늘 이미 매수를 실행했습니다.")
-            logger.info("📊 브라우저 없이 WebSocket 매도 모니터링만 시작합니다.")
+        # 실제 계좌에 보유 종목이 있는지 확인
+        trading_info = self.load_today_trading_info()
+        if trading_info:
+            logger.info("✅ 보유 종목이 있습니다. 매도 모니터링만 시작합니다.")
+            logger.info("📊 브라우저 없이 WebSocket 매도 모니터링을 진행합니다.")
             self.order_executed = True  # 매수 플래그 설정하여 추가 매수 방지
             return
 
@@ -353,6 +387,45 @@ class AutoTradingSystem:
         except Exception as e:
             logger.error(f"❌ WebSocket 모니터링 시작 실패: {e}")
 
+    async def price_polling_loop(self):
+        """REST API로 1분마다 현재가 조회 (WebSocket 백업)"""
+        await asyncio.sleep(60)  # 첫 1분은 대기 (WebSocket 우선)
+
+        while not self.sell_executed:
+            try:
+                # REST API로 현재가 조회
+                result = self.kiwoom_api.get_current_price(self.buy_info["stock_code"])
+
+                if result.get("success"):
+                    current_price = result.get("current_price", 0)
+
+                    if current_price > 0:
+                        buy_price = self.buy_info["buy_price"]
+                        profit_rate = (current_price - buy_price) / buy_price
+
+                        # DEBUG 모드일 때만 1분마다 출력
+                        if self.debug_mode:
+                            logger.info("=" * 80)
+                            logger.info(f"📊 실시간 시세 정보 (REST API)")
+                            logger.info(f"종목명: {self.buy_info['stock_name']}")
+                            logger.info(f"종목코드: {self.buy_info['stock_code']}")
+                            logger.info(f"평균 매수가: {buy_price:,}원")
+                            logger.info(f"현재가: {current_price:,}원")
+                            logger.info(f"수익률: {profit_rate*100:+.2f}% (목표: +1.00%)")
+                            logger.info(f"수익금: {(current_price - buy_price) * self.buy_info['quantity']:+,}원")
+                            logger.info("=" * 80)
+
+                        # 목표 수익률 도달 확인
+                        if profit_rate >= self.buy_info["target_profit_rate"]:
+                            await self.execute_auto_sell(current_price, profit_rate)
+                            break
+
+            except Exception as e:
+                logger.error(f"❌ 현재가 조회 중 오류: {e}")
+
+            # 1분 대기
+            await asyncio.sleep(60)
+
     async def on_price_update(self, stock_code: str, current_price: int, data: dict):
         """
         실시간 시세 업데이트 콜백 함수
@@ -372,10 +445,20 @@ class AutoTradingSystem:
         # 현재 수익률 계산
         profit_rate = (current_price - buy_price) / buy_price
 
-        # 로그 출력 (10초마다)
-        if not hasattr(self, '_last_profit_log') or (datetime.now() - self._last_profit_log).seconds >= 10:
-            logger.info(f"📊 [{stock_code}] 현재가: {current_price:,}원 | 수익률: {profit_rate*100:.2f}% (목표: 2.00%)")
-            self._last_profit_log = datetime.now()
+        # DEBUG 모드일 때만 실시간 시세 출력
+        if self.debug_mode:
+            # 로그 출력 (1초마다)
+            if not hasattr(self, '_last_profit_log') or (datetime.now() - self._last_profit_log).seconds >= 1:
+                logger.info("=" * 80)
+                logger.info(f"📊 실시간 시세 정보 (WebSocket)")
+                logger.info(f"종목명: {self.buy_info['stock_name']}")
+                logger.info(f"종목코드: {stock_code}")
+                logger.info(f"평균 매수가: {buy_price:,}원")
+                logger.info(f"현재가: {current_price:,}원")
+                logger.info(f"수익률: {profit_rate*100:+.2f}% (목표: +1.00%)")
+                logger.info(f"수익금: {(current_price - buy_price) * self.buy_info['quantity']:+,}원")
+                logger.info("=" * 80)
+                self._last_profit_log = datetime.now()
 
         # 목표 수익률(2%) 도달 확인
         if profit_rate >= self.buy_info["target_profit_rate"] and not self.sell_executed:
@@ -391,7 +474,7 @@ class AutoTradingSystem:
         self.sell_executed = True  # 즉시 플래그 설정 (중복 방지)
 
         logger.info("=" * 60)
-        logger.info(f"🎯 목표 수익률 2% 도달! 자동 매도를 시작합니다")
+        logger.info(f"🎯 목표 수익률 1% 도달! 자동 매도를 시작합니다")
         logger.info(f"매수가: {self.buy_info['buy_price']:,}원")
         logger.info(f"현재가: {current_price:,}원")
         logger.info(f"수익률: {profit_rate*100:.2f}%")
@@ -587,7 +670,7 @@ class AutoTradingSystem:
                             )
 
                             # WebSocket 실시간 시세 모니터링 시작
-                            logger.info("📈 WebSocket 실시간 시세 모니터링 시작 (목표: 2%)")
+                            logger.info("📈 WebSocket 실시간 시세 모니터링 시작 (목표: 1%)")
                             await self.start_websocket_monitoring()
                         else:
                             logger.error("❌ 자동 매수 실패")
@@ -636,12 +719,17 @@ class AutoTradingSystem:
                 logger.info("=" * 60)
 
                 # WebSocket 실시간 시세 모니터링 시작
-                logger.info("📈 WebSocket 매도 모니터링 시작 (목표: 2%)")
+                logger.info("📈 WebSocket 매도 모니터링 시작 (목표: 1%)")
                 await self.start_websocket_monitoring()
 
                 # WebSocket 모니터링이 계속 유지되도록 무한 대기
-                logger.info("⏱️  2% 수익률 도달 또는 Ctrl+C로 종료할 때까지 매도 모니터링합니다...")
+                logger.info("⏱️  1% 수익률 도달 또는 Ctrl+C로 종료할 때까지 매도 모니터링합니다...")
                 logger.info("💡 매도 타이밍을 놓치지 않도록 계속 모니터링합니다.")
+                logger.info("📡 WebSocket 실시간 시세 수신 중 (DEBUG 모드에서 1초마다 출력)")
+                logger.info("⏰ 장 마감 시간 외에는 REST API로 1분마다 현재가를 조회합니다.")
+
+                # REST API 폴링 태스크 추가 (백업 - WebSocket 데이터가 없을 때)
+                polling_task = asyncio.create_task(self.price_polling_loop())
 
                 # WebSocket receive_loop()가 계속 실행되므로 무한 대기
                 # 매도 완료 시 ws_receive_task가 cancel되면서 종료됨
@@ -650,6 +738,7 @@ class AutoTradingSystem:
                         await self.ws_receive_task
                     except asyncio.CancelledError:
                         logger.info("✅ WebSocket 모니터링이 정상 종료되었습니다.")
+                        polling_task.cancel()
 
             else:
                 self.is_monitoring = True

@@ -95,7 +95,7 @@ class KiwoomWebSocket:
         # 실시간 시세 등록 요청
         register_request = {
             "trnm": "REG",  # 등록
-            "grp_no": "0001",  # 그룹번호
+            "grp_no": "1",  # 그룹번호
             "refresh": "1",  # 기존 유지
             "data": [
                 {
@@ -129,7 +129,7 @@ class KiwoomWebSocket:
 
         unregister_request = {
             "trnm": "REMOVE",  # 해지
-            "grp_no": "0001",
+            "grp_no": "1",
             "data": [
                 {
                     "item": [stock_code],
@@ -172,15 +172,26 @@ class KiwoomWebSocket:
                         if data.get("trnm") == "PING":
                             # PING 메시지를 그대로 돌려보내서 연결 유지
                             await self.websocket.send(message)
-                            logger.debug("💓 PING 응답 전송 (연결 유지)")
+                            logger.info("💓 PING 응답 전송 (연결 유지)")
                             continue
 
                         # 실시간 데이터 수신 (trnm이 "REAL"인 경우)
                         if data.get("trnm") == "REAL":
                             await self._handle_realtime_data(data)
+                        # SYSTEM 메시지 처리 (연결 종료 등)
+                        elif data.get("trnm") == "SYSTEM":
+                            code = data.get("code")
+                            message = data.get("message", "")
+                            logger.warning(f"⚠️ SYSTEM 메시지: [{code}] {message}")
+
+                            # R10001: 동일한 App key로 중복 접속 - 연결 종료
+                            if code == "R10001":
+                                logger.warning("⚠️ 중복 접속으로 인한 연결 종료 - 재연결 대기")
+                                self.is_connected = False
+                                break
                         else:
                             # 기타 메시지 로깅 (디버깅용)
-                            logger.debug(f"기타 WebSocket 메시지: {data.get('trnm', 'UNKNOWN')}")
+                            logger.debug(f"📬 기타 WebSocket 메시지: {json.dumps(data, ensure_ascii=False)}")
 
                     except asyncio.TimeoutError:
                         # 60초 동안 메시지가 없으면 연결 상태 확인
@@ -250,18 +261,17 @@ class KiwoomWebSocket:
             for item in data_list:
                 type_code = item.get("type")  # 0A (주식기세)
                 stock_code = item.get("item")  # 종목코드
-                values = item.get("values", [])
+                values = item.get("values", {})  # 🔧 수정: 배열이 아닌 객체
 
                 if type_code == "0A" and values:
-                    # 주식기세 데이터 파싱
-                    realtime_data = {}
-                    for value_item in values:
-                        for key, val in value_item.items():
-                            realtime_data[key] = val
+                    # 주식기세 데이터 파싱 (values는 이미 dict)
+                    realtime_data = values
 
                     # 현재가 (10: 현재가)
+                    # +/- 기호 제거 후 파싱
                     current_price_str = realtime_data.get("10", "0")
-                    current_price = int(current_price_str) if current_price_str.isdigit() else 0
+                    current_price_str = current_price_str.replace("+", "").replace("-", "")
+                    current_price = int(current_price_str) if current_price_str.replace(".", "").isdigit() else 0
 
                     # 현재가 캐시 업데이트
                     self.current_prices[stock_code] = current_price

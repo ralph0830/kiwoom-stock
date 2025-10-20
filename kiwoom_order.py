@@ -331,6 +331,148 @@ class KiwoomOrderAPI:
                 "price": price
             }
 
+    def get_current_price(self, stock_code: str) -> Dict:
+        """
+        현재가 조회 (ka10001 - 주식현재가)
+
+        Args:
+            stock_code: 종목코드 (6자리)
+
+        Returns:
+            현재가 정보 딕셔너리
+        """
+        if not self.access_token:
+            self.get_access_token()
+
+        url = f"{self.base_url}/api/dostk/stkinfo"
+
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {self.access_token}",
+            "api-id": "ka10001",  # 주식현재가 TR (OPT10001)
+        }
+
+        body = {
+            "stk_cd": stock_code  # 종목코드
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=body)
+            response.raise_for_status()
+
+            result = response.json()
+
+            # 현재가 추출 (cur_prc 필드)
+            cur_prc_str = result.get("cur_prc", "0")
+
+            # +/- 기호 제거 후 정수 변환
+            cur_prc_str = cur_prc_str.replace("+", "").replace("-", "").replace(",", "")
+            current_price = int(cur_prc_str) if cur_prc_str.isdigit() else 0
+
+            return {
+                "success": True,
+                "stock_code": stock_code,
+                "current_price": current_price,
+                "data": result
+            }
+
+        except Exception as e:
+            logger.error(f"❌ 현재가 조회 실패: {e}")
+            return {
+                "success": False,
+                "stock_code": stock_code,
+                "current_price": 0,
+                "message": str(e)
+            }
+
+    def get_account_balance(self, query_date: str = None) -> Dict:
+        """
+        계좌 잔고 및 보유종목 조회 (ka01690)
+
+        Args:
+            query_date: 조회일자 (YYYYMMDD 형식, 기본값: 오늘)
+
+        Returns:
+            계좌 잔고 정보 딕셔너리
+        """
+        if not self.access_token:
+            self.get_access_token()
+
+        # 조회일자가 없으면 오늘 날짜 사용
+        if not query_date:
+            query_date = datetime.now().strftime("%Y%m%d")
+
+        url = f"{self.base_url}/api/dostk/acnt"
+
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {self.access_token}",
+            "api-id": "ka01690",  # 일별잔고수익률 TR
+        }
+
+        # JSON body로 전송
+        body = {
+            "qry_dt": query_date
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=body)
+            response.raise_for_status()
+
+            result = response.json()
+
+            # 보유종목 리스트 추출
+            raw_holdings = result.get("day_bal_rt", [])
+
+            # 실제 보유종목만 필터링 (종목코드가 있는 항목만)
+            holdings = [
+                holding for holding in raw_holdings
+                if holding.get("stk_cd", "").strip()  # 종목코드가 있는 경우만
+            ]
+
+            if holdings:
+                logger.info(f"✅ 계좌 잔고 조회 성공! (보유종목 {len(holdings)}개)")
+
+                # 보유종목 정보 로깅
+                for holding in holdings:
+                    stock_code = holding.get("stk_cd", "")
+                    stock_name = holding.get("stk_nm", "")
+
+                    # 안전한 정수 변환 (빈 문자열 처리)
+                    quantity = int(holding.get("rmnd_qty") or 0)  # 보유수량 (rmnd_qty)
+                    buy_price = int(holding.get("buy_uv") or 0)  # 매입단가
+                    current_price = int(holding.get("cur_prc") or 0)  # 현재가 (cur_prc)
+                    profit_loss = int(holding.get("evltv_prft") or 0)  # 평가손익 (evltv_prft)
+
+                    # 안전한 실수 변환
+                    profit_rate_str = holding.get("prft_rt", "0")
+                    profit_rate = float(profit_rate_str) if profit_rate_str else 0.0  # 수익률 (prft_rt)
+
+                    logger.info(f"  📊 [{stock_name}({stock_code})] 보유수량: {quantity}주, 매입단가: {buy_price:,}원, 현재가: {current_price:,}원, 평가손익: {profit_loss:+,}원 ({profit_rate:+.2f}%)")
+
+                return {
+                    "success": True,
+                    "holdings": holdings,
+                    "total_holdings": len(holdings),
+                    "data": result
+                }
+            else:
+                logger.info("ℹ️ 보유종목이 없습니다")
+                return {
+                    "success": True,
+                    "holdings": [],
+                    "total_holdings": 0,
+                    "data": result
+                }
+
+        except Exception as e:
+            logger.error(f"❌ 계좌 잔고 조회 실패: {e}")
+            return {
+                "success": False,
+                "holdings": [],
+                "message": str(e)
+            }
+
     def calculate_order_quantity(
         self,
         buy_price: int,
