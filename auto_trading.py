@@ -87,6 +87,15 @@ class AutoTradingSystem:
         if self.debug_mode:
             logger.info("🐛 DEBUG 모드 활성화: 실시간 시세를 계속 출력합니다")
 
+        # 매수 가능 시간 설정 (환경변수에서 읽기)
+        self.buy_start_time = os.getenv("BUY_START_TIME", "09:00")
+        self.buy_end_time = os.getenv("BUY_END_TIME", "09:10")
+
+        # 매도 모니터링 활성화 여부 (환경변수에서 읽기)
+        self.enable_sell_monitoring = os.getenv("ENABLE_SELL_MONITORING", "true").lower() == "true"
+        if not self.enable_sell_monitoring:
+            logger.info("⏸️  매도 모니터링이 비활성화되었습니다 (ENABLE_SELL_MONITORING=false)")
+
     def check_today_trading_done(self) -> bool:
         """
         오늘 이미 매수했는지 확인
@@ -194,18 +203,10 @@ class AutoTradingSystem:
 
     async def start_browser(self):
         """브라우저 시작 및 페이지 로드"""
-        logger.info("🚀 자동매매 시스템 시작...")
+        logger.info("🚀 브라우저 시작...")
         logger.info(f"계좌번호: {self.account_no}")
         logger.info(f"최대 투자금액: {self.max_investment:,}원")
         logger.info(f"🎯 목표 수익률: {self.buy_info['target_profit_rate']*100:.2f}%")
-
-        # 실제 계좌에 보유 종목이 있는지 확인
-        trading_info = self.load_today_trading_info()
-        if trading_info:
-            logger.info("✅ 보유 종목이 있습니다. 매도 모니터링만 시작합니다.")
-            logger.info("📊 브라우저 없이 WebSocket 매도 모니터링을 진행합니다.")
-            self.order_executed = True  # 매수 플래그 설정하여 추가 매수 방지
-            return
 
         self.playwright = await async_playwright().start()
         self.browser = await self.playwright.chromium.launch(headless=False)
@@ -374,8 +375,8 @@ class AutoTradingSystem:
     async def start_websocket_monitoring(self):
         """WebSocket 실시간 시세 모니터링 시작"""
         try:
-            # WebSocket 생성 및 연결
-            self.websocket = KiwoomWebSocket(self.kiwoom_api)
+            # WebSocket 생성 및 연결 (debug_mode 전달)
+            self.websocket = KiwoomWebSocket(self.kiwoom_api, debug_mode=self.debug_mode)
             await self.websocket.connect()
 
             # 실시간 시세 등록 (콜백 함수 등록)
@@ -394,10 +395,12 @@ class AutoTradingSystem:
 
     async def price_polling_loop(self):
         """REST API로 1분마다 현재가 조회 (WebSocket 백업)"""
+        logger.info("🔄 REST API 백업 폴링 시작 (1분 대기 후 시작)")
         await asyncio.sleep(60)  # 첫 1분은 대기 (WebSocket 우선)
 
         while not self.sell_executed:
             try:
+                logger.info("📡 REST API로 현재가 조회 중...")
                 # REST API로 현재가 조회
                 result = self.kiwoom_api.get_current_price(self.buy_info["stock_code"])
 
@@ -408,27 +411,32 @@ class AutoTradingSystem:
                         buy_price = self.buy_info["buy_price"]
                         profit_rate = (current_price - buy_price) / buy_price
 
-                        # DEBUG 모드일 때만 1분마다 출력
-                        if self.debug_mode:
-                            logger.info("=" * 80)
-                            logger.info(f"📊 실시간 시세 정보 (REST API)")
-                            logger.info(f"종목명: {self.buy_info['stock_name']}")
-                            logger.info(f"종목코드: {self.buy_info['stock_code']}")
-                            logger.info(f"평균 매수가: {buy_price:,}원")
-                            logger.info(f"현재가: {current_price:,}원")
-                            logger.info(f"수익률: {profit_rate*100:+.2f}% (목표: +1.00%)")
-                            logger.info(f"수익금: {(current_price - buy_price) * self.buy_info['quantity']:+,}원")
-                            logger.info("=" * 80)
+                        # 항상 REST API 조회 결과 출력
+                        logger.info("=" * 80)
+                        logger.info(f"📊 실시간 시세 정보 (REST API)")
+                        logger.info(f"종목명: {self.buy_info['stock_name']}")
+                        logger.info(f"종목코드: {self.buy_info['stock_code']}")
+                        logger.info(f"평균 매수가: {buy_price:,}원")
+                        logger.info(f"현재가: {current_price:,}원")
+                        logger.info(f"수익률: {profit_rate*100:+.2f}% (목표: +{self.buy_info['target_profit_rate']*100:.2f}%)")
+                        logger.info(f"수익금: {(current_price - buy_price) * self.buy_info['quantity']:+,}원")
+                        logger.info("=" * 80)
 
                         # 목표 수익률 도달 확인
                         if profit_rate >= self.buy_info["target_profit_rate"]:
+                            logger.info("🎯 REST API로 목표 수익률 도달 확인!")
                             await self.execute_auto_sell(current_price, profit_rate)
                             break
+                    else:
+                        logger.warning(f"⚠️ REST API 현재가가 0입니다: {result}")
+                else:
+                    logger.error(f"❌ REST API 현재가 조회 실패: {result}")
 
             except Exception as e:
                 logger.error(f"❌ 현재가 조회 중 오류: {e}")
 
             # 1분 대기
+            logger.info("⏳ 1분 후 다시 REST API 조회...")
             await asyncio.sleep(60)
 
     async def on_price_update(self, stock_code: str, current_price: int, data: dict):
@@ -460,7 +468,7 @@ class AutoTradingSystem:
                 logger.info(f"종목코드: {stock_code}")
                 logger.info(f"평균 매수가: {buy_price:,}원")
                 logger.info(f"현재가: {current_price:,}원")
-                logger.info(f"수익률: {profit_rate*100:+.2f}% (목표: +1.00%)")
+                logger.info(f"수익률: {profit_rate*100:+.2f}% (목표: +{self.buy_info['target_profit_rate']*100:.2f}%)")
                 logger.info(f"수익금: {(current_price - buy_price) * self.buy_info['quantity']:+,}원")
                 logger.info("=" * 80)
                 self._last_profit_log = datetime.now()
@@ -479,16 +487,16 @@ class AutoTradingSystem:
         self.sell_executed = True  # 즉시 플래그 설정 (중복 방지)
 
         logger.info("=" * 60)
-        logger.info(f"🎯 목표 수익률 1% 도달! 자동 매도를 시작합니다")
+        logger.info(f"🎯 목표 수익률 {self.buy_info['target_profit_rate']*100:.2f}% 도달! 자동 매도를 시작합니다")
         logger.info(f"매수가: {self.buy_info['buy_price']:,}원")
         logger.info(f"현재가: {current_price:,}원")
         logger.info(f"수익률: {profit_rate*100:.2f}%")
         logger.info("=" * 60)
 
-        # 매도가 계산 (목표가에서 한 틱 아래)
-        sell_price = calculate_sell_price(self.buy_info["buy_price"], self.buy_info["target_profit_rate"])
+        # 매도가 계산 (현재가에서 한 틱 아래)
+        sell_price = calculate_sell_price(current_price)
 
-        logger.info(f"💰 매도 주문가: {sell_price:,}원 (목표가에서 한 틱 아래)")
+        logger.info(f"💰 매도 주문가: {sell_price:,}원 (현재가에서 한 틱 아래)")
 
         try:
             # 지정가 매도 주문
@@ -537,22 +545,22 @@ class AutoTradingSystem:
 
         # 로그 출력 (10초마다)
         if not hasattr(self, '_last_profit_log') or (datetime.now() - self._last_profit_log).seconds >= 10:
-            logger.info(f"📊 현재가: {current_price:,}원 | 수익률: {profit_rate*100:.2f}% (목표: 2.00%)")
+            logger.info(f"📊 현재가: {current_price:,}원 | 수익률: {profit_rate*100:.2f}% (목표: {self.buy_info['target_profit_rate']*100:.2f}%)")
             self._last_profit_log = datetime.now()
 
-        # 목표 수익률(2%) 도달 확인
+        # 목표 수익률 도달 확인
         if profit_rate >= self.buy_info["target_profit_rate"]:
             logger.info("=" * 60)
-            logger.info(f"🎯 목표 수익률 2% 도달! 자동 매도를 시작합니다")
+            logger.info(f"🎯 목표 수익률 {self.buy_info['target_profit_rate']*100:.2f}% 도달! 자동 매도를 시작합니다")
             logger.info(f"매수가: {buy_price:,}원")
             logger.info(f"현재가: {current_price:,}원")
             logger.info(f"수익률: {profit_rate*100:.2f}%")
             logger.info("=" * 60)
 
-            # 매도가 계산 (목표가에서 한 틱 아래)
-            sell_price = calculate_sell_price(buy_price, self.buy_info["target_profit_rate"])
+            # 매도가 계산 (현재가에서 한 틱 아래)
+            sell_price = calculate_sell_price(current_price)
 
-            logger.info(f"💰 매도 주문가: {sell_price:,}원 (목표가에서 한 틱 아래)")
+            logger.info(f"💰 매도 주문가: {sell_price:,}원 (현재가에서 한 틱 아래)")
 
             try:
                 # 지정가 매도 주문
@@ -637,16 +645,44 @@ class AutoTradingSystem:
 
         logger.info(f"💾 매도 결과 저장: {filename}")
 
+    def is_buy_time_allowed(self) -> bool:
+        """
+        매수 가능 시간인지 확인 (환경변수 기준)
+
+        Returns:
+            True: 매수 가능 시간, False: 매수 불가 시간
+        """
+        now = datetime.now()
+        current_time = now.strftime("%H:%M")
+
+        # 환경변수에서 읽은 시간 기준으로 매수 가능 여부 확인
+        if self.buy_start_time <= current_time < self.buy_end_time:
+            return True
+        return False
+
     async def monitor_and_trade(self):
         """실시간 모니터링 및 자동 매매"""
         logger.info("🔍 종목 감시 시작...")
-        logger.info("종목 포착 시간: 09:00 ~ 09:10")
+        logger.info(f"⏰ 매수 가능 시간: {self.buy_start_time} ~ {self.buy_end_time}")
 
         check_interval = 0.5  # 0.5초마다 체크 (빠른 감지)
         last_waiting_log_time = None  # 마지막 대기 로그 출력 시간
+        last_time_check_log = None  # 마지막 시간 체크 로그 출력 시간
 
         while self.is_monitoring:
             try:
+                # 매수 가능 시간 체크
+                if not self.is_buy_time_allowed():
+                    # 10초마다 한 번만 로그 출력
+                    now = datetime.now()
+                    if last_time_check_log is None or (now - last_time_check_log).seconds >= 10:
+                        current_time = now.strftime("%H:%M:%S")
+                        logger.info(f"⏸️  매수 가능 시간이 아닙니다. 현재 시각: {current_time} (매수 시간: {self.buy_start_time}~{self.buy_end_time})")
+                        last_time_check_log = now
+
+                    await asyncio.sleep(check_interval)
+                    continue
+
                 stock_data = await self.check_stock_data()
 
                 if stock_data and stock_data.get("hasData"):
@@ -674,9 +710,13 @@ class AutoTradingSystem:
                                 quantity=self.buy_info["quantity"]
                             )
 
-                            # WebSocket 실시간 시세 모니터링 시작
-                            logger.info("📈 WebSocket 실시간 시세 모니터링 시작 (목표: 1%)")
-                            await self.start_websocket_monitoring()
+                            # WebSocket 실시간 시세 모니터링 시작 (환경변수 확인)
+                            if self.enable_sell_monitoring:
+                                logger.info(f"📈 WebSocket 실시간 시세 모니터링 시작 (목표: {self.buy_info['target_profit_rate']*100:.2f}%)")
+                                await self.start_websocket_monitoring()
+                            else:
+                                logger.info("⏸️  매도 모니터링이 비활성화되어 있습니다. 수동으로 매도해야 합니다.")
+                                self.is_monitoring = False  # 모니터링 중지
                         else:
                             logger.error("❌ 자동 매수 실패")
                             # 실패해도 재시도하지 않음 (중복 주문 방지)
@@ -704,11 +744,15 @@ class AutoTradingSystem:
             duration: 모니터링 지속 시간(초). 기본값 600초(10분)
         """
         try:
-            await self.start_browser()
-
-            # 오늘 이미 매수했는지 확인하고 매도 모니터링 시작
+            # 먼저 계좌 잔고 조회 (브라우저 시작 전)
             trading_info = self.load_today_trading_info()
-            if trading_info and self.order_executed:
+
+            # 보유 종목이 있으면 매도 모니터링만 진행 (브라우저 없이)
+            if trading_info:
+                logger.info("✅ 보유 종목이 있습니다. 매도 모니터링만 시작합니다.")
+                logger.info("📊 브라우저 없이 WebSocket 매도 모니터링을 진행합니다.")
+                self.order_executed = True  # 매수 플래그 설정하여 추가 매수 방지
+
                 # 매수 정보 복원
                 self.buy_info["stock_code"] = trading_info.get("stock_code")
                 self.buy_info["stock_name"] = trading_info.get("stock_name")
@@ -723,29 +767,51 @@ class AutoTradingSystem:
                 logger.info(f"수량: {self.buy_info['quantity']}주")
                 logger.info("=" * 60)
 
-                # WebSocket 실시간 시세 모니터링 시작
-                logger.info("📈 WebSocket 매도 모니터링 시작 (목표: 1%)")
-                await self.start_websocket_monitoring()
+                # WebSocket 실시간 시세 모니터링 시작 (환경변수 확인)
+                if self.enable_sell_monitoring:
+                    logger.info(f"📈 WebSocket 매도 모니터링 시작 (목표: {self.buy_info['target_profit_rate']*100:.2f}%)")
+                    await self.start_websocket_monitoring()
 
-                # WebSocket 모니터링이 계속 유지되도록 무한 대기
-                logger.info("⏱️  1% 수익률 도달 또는 Ctrl+C로 종료할 때까지 매도 모니터링합니다...")
-                logger.info("💡 매도 타이밍을 놓치지 않도록 계속 모니터링합니다.")
-                logger.info("📡 WebSocket 실시간 시세 수신 중 (DEBUG 모드에서 1초마다 출력)")
-                logger.info("⏰ 장 마감 시간 외에는 REST API로 1분마다 현재가를 조회합니다.")
+                    # WebSocket 모니터링이 계속 유지되도록 무한 대기
+                    logger.info(f"⏱️  {self.buy_info['target_profit_rate']*100:.2f}% 수익률 도달 또는 Ctrl+C로 종료할 때까지 매도 모니터링합니다...")
+                    logger.info("💡 매도 타이밍을 놓치지 않도록 계속 모니터링합니다.")
+                    logger.info("📡 WebSocket 실시간 시세 수신 중 (DEBUG 모드에서 1초마다 출력)")
+                    logger.info("⏰ 장 마감 시간 외에는 REST API로 1분마다 현재가를 조회합니다.")
 
-                # REST API 폴링 태스크 추가 (백업 - WebSocket 데이터가 없을 때)
-                polling_task = asyncio.create_task(self.price_polling_loop())
+                    # REST API 폴링 태스크 추가 (백업 - WebSocket 데이터가 없을 때)
+                    polling_task = asyncio.create_task(self.price_polling_loop())
 
-                # WebSocket receive_loop()가 계속 실행되므로 무한 대기
-                # 매도 완료 시 ws_receive_task가 cancel되면서 종료됨
-                if self.ws_receive_task:
-                    try:
-                        await self.ws_receive_task
-                    except asyncio.CancelledError:
-                        logger.info("✅ WebSocket 모니터링이 정상 종료되었습니다.")
-                        polling_task.cancel()
+                    # WebSocket receive_loop()가 계속 실행되므로 무한 대기
+                    # 매도 완료 시 ws_receive_task가 cancel되면서 종료됨
+                    if self.ws_receive_task:
+                        try:
+                            await self.ws_receive_task
+                        except asyncio.CancelledError:
+                            logger.info("✅ WebSocket 모니터링이 정상 종료되었습니다.")
+                            polling_task.cancel()
+                else:
+                    logger.info("⏸️  매도 모니터링이 비활성화되어 있습니다.")
+                    logger.info("💡 수동으로 매도를 진행해야 합니다.")
+                    logger.info(f"📊 보유 종목: {self.buy_info['stock_name']} ({self.buy_info['stock_code']})")
+                    logger.info(f"📊 매수가: {self.buy_info['buy_price']:,}원 | 수량: {self.buy_info['quantity']}주")
+                    return
 
+            # 보유 종목이 없으면 매수 가능 시간 확인
             else:
+                # 매수 가능 시간이 아니면 브라우저 시작하지 않고 로그만 출력
+                if not self.is_buy_time_allowed():
+                    now = datetime.now()
+                    current_time = now.strftime("%H:%M:%S")
+                    logger.info("=" * 60)
+                    logger.info("⏸️  매수 가능 시간이 아닙니다.")
+                    logger.info(f"현재 시각: {current_time}")
+                    logger.info(f"매수 가능 시간: {self.buy_start_time} ~ {self.buy_end_time}")
+                    logger.info("브라우저를 시작하지 않습니다.")
+                    logger.info("=" * 60)
+                    return
+
+                # 매수 가능 시간이면 브라우저 시작
+                await self.start_browser()
                 self.is_monitoring = True
 
                 # 모니터링 태스크 시작

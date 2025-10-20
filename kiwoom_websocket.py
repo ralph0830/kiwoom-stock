@@ -17,10 +17,11 @@ logger = logging.getLogger(__name__)
 class KiwoomWebSocket:
     """키움증권 WebSocket 실시간 시세 클래스"""
 
-    def __init__(self, kiwoom_api: KiwoomOrderAPI):
+    def __init__(self, kiwoom_api: KiwoomOrderAPI, debug_mode: bool = False):
         """
         Args:
             kiwoom_api: 인증된 KiwoomOrderAPI 인스턴스
+            debug_mode: 디버그 모드 (상세 로그 출력)
         """
         self.kiwoom_api = kiwoom_api
         self.ws_url = f"{kiwoom_api.base_url.replace('https', 'wss')}:10000/api/dostk/websocket"
@@ -28,6 +29,7 @@ class KiwoomWebSocket:
         self.is_connected = False
         self.callbacks = {}  # 종목코드별 콜백 함수
         self.current_prices = {}  # 종목코드별 현재가 캐시
+        self.debug_mode = debug_mode  # 디버그 모드
 
     async def connect(self):
         """WebSocket 연결"""
@@ -79,7 +81,7 @@ class KiwoomWebSocket:
 
     async def register_stock(self, stock_code: str, callback: Optional[Callable] = None):
         """
-        실시간 시세 등록 (0A: 주식기세)
+        실시간 시세 등록 (0A: 주식기세, 0B: 주식체결)
 
         Args:
             stock_code: 종목코드 (6자리)
@@ -92,7 +94,7 @@ class KiwoomWebSocket:
         if callback:
             self.callbacks[stock_code] = callback
 
-        # 실시간 시세 등록 요청
+        # 실시간 시세 등록 요청 (0A: 주식기세, 0B: 주식체결 모두 등록)
         register_request = {
             "trnm": "REG",  # 등록
             "grp_no": "1",  # 그룹번호
@@ -100,7 +102,7 @@ class KiwoomWebSocket:
             "data": [
                 {
                     "item": [stock_code],  # 종목코드
-                    "type": ["0A"]  # 주식기세
+                    "type": ["0A", "0B"]  # 0A: 주식기세 (체결없이 가격변경), 0B: 주식체결 (실제 체결)
                 }
             ]
         }
@@ -133,7 +135,7 @@ class KiwoomWebSocket:
             "data": [
                 {
                     "item": [stock_code],
-                    "type": ["0A"]
+                    "type": ["0A", "0B"]  # 등록한 모든 타입 해지
                 }
             ]
         }
@@ -172,11 +174,14 @@ class KiwoomWebSocket:
                         if data.get("trnm") == "PING":
                             # PING 메시지를 그대로 돌려보내서 연결 유지
                             await self.websocket.send(message)
-                            logger.info("💓 PING 응답 전송 (연결 유지)")
+                            if self.debug_mode:
+                                logger.info("💓 PING 응답 전송 (연결 유지)")
                             continue
 
                         # 실시간 데이터 수신 (trnm이 "REAL"인 경우)
                         if data.get("trnm") == "REAL":
+                            if self.debug_mode:
+                                logger.info(f"📡 REAL 메시지 수신: {json.dumps(data, ensure_ascii=False)[:200]}")
                             await self._handle_realtime_data(data)
                         # SYSTEM 메시지 처리 (연결 종료 등)
                         elif data.get("trnm") == "SYSTEM":
@@ -191,7 +196,8 @@ class KiwoomWebSocket:
                                 break
                         else:
                             # 기타 메시지 로깅 (디버깅용)
-                            logger.debug(f"📬 기타 WebSocket 메시지: {json.dumps(data, ensure_ascii=False)}")
+                            if self.debug_mode:
+                                logger.info(f"📬 기타 WebSocket 메시지: {json.dumps(data, ensure_ascii=False)[:200]}")
 
                     except asyncio.TimeoutError:
                         # 60초 동안 메시지가 없으면 연결 상태 확인
@@ -259,22 +265,24 @@ class KiwoomWebSocket:
             data_list = data.get("data", [])
 
             for item in data_list:
-                type_code = item.get("type")  # 0A (주식기세)
+                type_code = item.get("type")  # 0A (주식기세) 또는 0B (주식체결)
                 stock_code = item.get("item")  # 종목코드
-                values = item.get("values", {})  # 🔧 수정: 배열이 아닌 객체
+                values = item.get("values", {})  # 실시간 데이터 값
 
-                if type_code == "0A" and values:
-                    # 주식기세 데이터 파싱 (values는 이미 dict)
+                # 0A (주식기세) 또는 0B (주식체결) 모두 처리
+                if type_code in ["0A", "0B"] and values:
+                    # 실시간 데이터 파싱
                     realtime_data = values
 
                     # 현재가 (10: 현재가)
                     # +/- 기호 제거 후 파싱
                     current_price_str = realtime_data.get("10", "0")
-                    current_price_str = current_price_str.replace("+", "").replace("-", "")
+                    current_price_str = current_price_str.replace("+", "").replace("-", "").replace(" ", "")
                     current_price = int(current_price_str) if current_price_str.replace(".", "").isdigit() else 0
 
                     # 현재가 캐시 업데이트
-                    self.current_prices[stock_code] = current_price
+                    if current_price > 0:
+                        self.current_prices[stock_code] = current_price
 
                     # 콜백 함수 호출
                     if stock_code in self.callbacks:
