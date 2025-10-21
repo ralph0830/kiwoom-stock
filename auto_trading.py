@@ -96,6 +96,18 @@ class AutoTradingSystem:
         if not self.enable_sell_monitoring:
             logger.info("⏸️  매도 모니터링이 비활성화되었습니다 (ENABLE_SELL_MONITORING=false)")
 
+        # 손절 모니터링 활성화 여부 (환경변수에서 읽기)
+        self.enable_stop_loss = os.getenv("ENABLE_STOP_LOSS", "true").lower() == "true"
+
+        # 손절 수익률 환경변수에서 읽기 (기본값: -2.5%)
+        stop_loss_rate_percent = float(os.getenv("STOP_LOSS_RATE", "-2.5"))
+        self.stop_loss_rate = stop_loss_rate_percent / 100  # 퍼센트를 소수로 변환
+
+        if self.enable_stop_loss:
+            logger.info(f"🛡️  손절 모니터링 활성화: {stop_loss_rate_percent}% 이하 시 시장가 매도")
+        else:
+            logger.info("⏸️  손절 모니터링이 비활성화되었습니다 (ENABLE_STOP_LOSS=false)")
+
     def check_today_trading_done(self) -> bool:
         """
         오늘 이미 매수했는지 확인
@@ -468,17 +480,22 @@ class AutoTradingSystem:
                 logger.info(f"종목코드: {stock_code}")
                 logger.info(f"평균 매수가: {buy_price:,}원")
                 logger.info(f"현재가: {current_price:,}원")
-                logger.info(f"수익률: {profit_rate*100:+.2f}% (목표: +{self.buy_info['target_profit_rate']*100:.2f}%)")
+                logger.info(f"수익률: {profit_rate*100:+.2f}% (목표: +{self.buy_info['target_profit_rate']*100:.2f}%, 손절: {self.stop_loss_rate*100:.2f}%)")
                 logger.info(f"수익금: {(current_price - buy_price) * self.buy_info['quantity']:+,}원")
                 logger.info("=" * 80)
                 self._last_profit_log = datetime.now()
 
-        # 목표 수익률(2%) 도달 확인
+        # 손절 조건 체크 (손절이 목표 수익률보다 우선)
+        if self.enable_stop_loss and profit_rate <= self.stop_loss_rate and not self.sell_executed:
+            await self.execute_stop_loss(current_price, profit_rate)
+            return
+
+        # 목표 수익률 도달 확인
         if profit_rate >= self.buy_info["target_profit_rate"] and not self.sell_executed:
             await self.execute_auto_sell(current_price, profit_rate)
 
     async def execute_auto_sell(self, current_price: int, profit_rate: float):
-        """자동 매도 실행"""
+        """자동 매도 실행 (100% 전량 매도)"""
         # 중복 매도 방지 (재진입 방지)
         if self.sell_executed:
             logger.warning("⚠️ 이미 매도 주문을 실행했습니다. 중복 실행 방지")
@@ -493,16 +510,61 @@ class AutoTradingSystem:
         logger.info(f"수익률: {profit_rate*100:.2f}%")
         logger.info("=" * 60)
 
+        # 실제 보유 수량 및 평균 매입단가 조회 (100% 전량 매도를 위해)
+        logger.info("📊 계좌 잔고에서 실제 보유 정보를 조회합니다...")
+        balance_result = self.kiwoom_api.get_account_balance()
+
+        actual_quantity = self.buy_info["quantity"]  # 기본값 (잔고 조회 실패 시 사용)
+        actual_buy_price = self.buy_info["buy_price"]  # 기본값
+
+        if balance_result.get("success"):
+            holdings = balance_result.get("holdings", [])
+            # 해당 종목 찾기
+            for holding in holdings:
+                if holding.get("stk_cd") == self.buy_info["stock_code"]:
+                    actual_quantity = int(holding.get("rmnd_qty") or 0)
+                    actual_buy_price = int(holding.get("buy_uv") or 0)  # 평균 매입단가
+
+                    logger.info(f"✅ 실제 보유 정보 확인:")
+                    logger.info(f"   보유 수량: {actual_quantity}주")
+                    logger.info(f"   평균 매입단가: {actual_buy_price:,}원")
+
+                    # 보유 수량이 저장된 수량과 다르면 경고 (수동 매수 포함)
+                    if actual_quantity != self.buy_info["quantity"]:
+                        logger.warning(f"⚠️ 보유 수량이 기록과 다릅니다! 기록: {self.buy_info['quantity']}주, 실제: {actual_quantity}주")
+                        logger.warning(f"⚠️ 수동 매수를 포함하여 전량 매도합니다.")
+
+                    # 평균 매입단가가 다르면 경고 (수동 매수로 평균단가 변경)
+                    if actual_buy_price != self.buy_info["buy_price"]:
+                        logger.warning(f"⚠️ 평균 매입단가가 기록과 다릅니다! 기록: {self.buy_info['buy_price']:,}원, 실제: {actual_buy_price:,}원")
+                        logger.warning(f"⚠️ 실제 평균 매입단가 기준으로 수익률을 재계산합니다.")
+
+                        # 수익률 재계산
+                        profit_rate = (current_price - actual_buy_price) / actual_buy_price
+                        logger.info(f"📊 재계산된 수익률: {profit_rate*100:+.2f}%")
+                    break
+            else:
+                logger.warning(f"⚠️ 계좌에서 종목을 찾을 수 없습니다. 기록된 정보로 매도합니다.")
+        else:
+            logger.warning(f"⚠️ 계좌 잔고 조회 실패. 기록된 정보로 매도합니다.")
+
+        # 매도 수량이 0이면 중단
+        if actual_quantity <= 0:
+            logger.error("❌ 매도할 수량이 0입니다. 매도를 중단합니다.")
+            return
+
+        logger.info(f"💰 매도 수량: {actual_quantity}주 (100% 전량)")
+
         # 매도가 계산 (현재가에서 한 틱 아래)
         sell_price = calculate_sell_price(current_price)
 
         logger.info(f"💰 매도 주문가: {sell_price:,}원 (현재가에서 한 틱 아래)")
 
         try:
-            # 지정가 매도 주문
+            # 지정가 매도 주문 (실제 보유 수량으로)
             sell_result = self.kiwoom_api.place_limit_sell_order(
                 stock_code=self.buy_info["stock_code"],
-                quantity=self.buy_info["quantity"],
+                quantity=actual_quantity,  # 실제 보유 수량
                 price=sell_price,
                 account_no=self.account_no
             )
@@ -516,13 +578,84 @@ class AutoTradingSystem:
                     if self.ws_receive_task:
                         self.ws_receive_task.cancel()
 
-                # 매도 결과 저장
-                await self.save_sell_result_ws(current_price, sell_result, profit_rate)
+                # 매도 결과 저장 (실제 매도 수량 및 평균 매입단가 반영)
+                await self.save_sell_result_ws(current_price, sell_result, profit_rate, actual_quantity, actual_buy_price)
             else:
                 logger.error("❌ 자동 매도 실패")
 
         except Exception as e:
             logger.error(f"❌ 매도 주문 실행 중 오류: {e}")
+
+    async def execute_stop_loss(self, current_price: int, profit_rate: float):
+        """손절 실행 (시장가 즉시 매도)"""
+        # 중복 매도 방지 (재진입 방지)
+        if self.sell_executed:
+            logger.warning("⚠️ 이미 매도 주문을 실행했습니다. 중복 실행 방지")
+            return
+
+        self.sell_executed = True  # 즉시 플래그 설정 (중복 방지)
+
+        logger.info("=" * 60)
+        logger.info(f"🚨 손절 조건 도달! ({self.stop_loss_rate*100:.2f}% 이하)")
+        logger.info(f"매수가: {self.buy_info['buy_price']:,}원")
+        logger.info(f"현재가: {current_price:,}원")
+        logger.info(f"손실률: {profit_rate*100:.2f}%")
+        logger.info("=" * 60)
+
+        # 실제 보유 수량 조회 (100% 전량 매도를 위해)
+        logger.info("📊 계좌 잔고에서 실제 보유 수량을 조회합니다...")
+        balance_result = self.kiwoom_api.get_account_balance()
+
+        actual_quantity = self.buy_info["quantity"]  # 기본값
+        actual_buy_price = self.buy_info["buy_price"]  # 기본값
+
+        if balance_result.get("success"):
+            holdings = balance_result.get("holdings", [])
+            for holding in holdings:
+                if holding.get("stk_cd") == self.buy_info["stock_code"]:
+                    actual_quantity = int(holding.get("rmnd_qty") or 0)
+                    actual_buy_price = int(holding.get("buy_uv") or 0)
+
+                    logger.info(f"✅ 실제 보유 수량 확인: {actual_quantity}주")
+                    logger.info(f"✅ 평균 매입단가: {actual_buy_price:,}원")
+
+                    # 평균 매입단가가 다르면 손실률 재계산
+                    if actual_buy_price != self.buy_info["buy_price"]:
+                        profit_rate = (current_price - actual_buy_price) / actual_buy_price
+                        logger.info(f"📊 재계산된 손실률: {profit_rate*100:+.2f}%")
+                    break
+
+        # 매도 수량이 0이면 중단
+        if actual_quantity <= 0:
+            logger.error("❌ 매도할 수량이 0입니다. 손절을 중단합니다.")
+            return
+
+        logger.info(f"💰 손절 매도 수량: {actual_quantity}주 (100% 전량 시장가)")
+
+        try:
+            # 시장가 매도 주문 (즉시 체결)
+            sell_result = self.kiwoom_api.place_market_sell_order(
+                stock_code=self.buy_info["stock_code"],
+                quantity=actual_quantity,
+                account_no=self.account_no
+            )
+
+            if sell_result and sell_result.get("success"):
+                logger.info("✅ 손절 매도 완료!")
+
+                # WebSocket 모니터링 중지
+                if self.websocket:
+                    await self.websocket.unregister_stock(self.buy_info["stock_code"])
+                    if self.ws_receive_task:
+                        self.ws_receive_task.cancel()
+
+                # 손절 결과 저장
+                await self.save_stop_loss_result(current_price, sell_result, profit_rate, actual_quantity, actual_buy_price)
+            else:
+                logger.error("❌ 손절 매도 실패")
+
+        except Exception as e:
+            logger.error(f"❌ 손절 주문 실행 중 오류: {e}")
 
     async def check_and_sell(self, stock_data: dict):
         """
@@ -623,15 +756,23 @@ class AutoTradingSystem:
 
         logger.info(f"💾 매도 결과 저장: {filename}")
 
-    async def save_sell_result_ws(self, current_price: int, order_result: dict, profit_rate: float):
+    async def save_sell_result_ws(self, current_price: int, order_result: dict, profit_rate: float, actual_quantity: int = None, actual_buy_price: int = None):
         """매도 결과 저장 (WebSocket 기반)"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         stock_name = self.buy_info["stock_name"].replace("/", "_")
+
+        # 실제 매도 수량 (파라미터로 받거나 buy_info에서 가져옴)
+        sell_quantity = actual_quantity if actual_quantity is not None else self.buy_info["quantity"]
+
+        # 실제 평균 매입단가 (파라미터로 받거나 buy_info에서 가져옴)
+        avg_buy_price = actual_buy_price if actual_buy_price is not None else self.buy_info["buy_price"]
 
         result = {
             "timestamp": timestamp,
             "action": "SELL",
             "buy_info": self.buy_info,
+            "actual_avg_buy_price": avg_buy_price,  # 실제 평균 매입단가
+            "sell_quantity": sell_quantity,  # 실제 매도 수량
             "current_price": current_price,
             "profit_rate": f"{profit_rate*100:.2f}%",
             "order_result": order_result,
@@ -644,6 +785,37 @@ class AutoTradingSystem:
             json.dump(result, f, ensure_ascii=False, indent=2)
 
         logger.info(f"💾 매도 결과 저장: {filename}")
+
+    async def save_stop_loss_result(self, current_price: int, order_result: dict, profit_rate: float, actual_quantity: int = None, actual_buy_price: int = None):
+        """손절 결과 저장"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stock_name = self.buy_info["stock_name"].replace("/", "_")
+
+        # 실제 매도 수량
+        sell_quantity = actual_quantity if actual_quantity is not None else self.buy_info["quantity"]
+
+        # 실제 평균 매입단가
+        avg_buy_price = actual_buy_price if actual_buy_price is not None else self.buy_info["buy_price"]
+
+        result = {
+            "timestamp": timestamp,
+            "action": "STOP_LOSS",
+            "buy_info": self.buy_info,
+            "actual_avg_buy_price": avg_buy_price,
+            "sell_quantity": sell_quantity,
+            "current_price": current_price,
+            "profit_rate": f"{profit_rate*100:.2f}%",
+            "stop_loss_rate": f"{self.stop_loss_rate*100:.2f}%",
+            "order_result": order_result,
+            "source": "WebSocket 실시간 시세 (손절)"
+        }
+
+        filename = self.result_dir / f"{timestamp}_{stock_name}_손절결과.json"
+
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"💾 손절 결과 저장: {filename}")
 
     def is_buy_time_allowed(self) -> bool:
         """

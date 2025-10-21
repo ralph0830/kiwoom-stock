@@ -331,6 +331,87 @@ class KiwoomOrderAPI:
                 "price": price
             }
 
+    def place_market_sell_order(
+        self,
+        stock_code: str,
+        quantity: int,
+        account_no: str
+    ) -> Dict:
+        """
+        시장가 매도 주문 (손절용)
+
+        Args:
+            stock_code: 종목코드 (6자리)
+            quantity: 매도 수량
+            account_no: 계좌번호 (사용하지 않음)
+
+        Returns:
+            주문 결과 딕셔너리
+        """
+        if not self.access_token:
+            self.get_access_token()
+
+        url = f"{self.base_url}/api/dostk/ordr"
+
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {self.access_token}",
+            "api-id": "kt10001",  # 주식 매도주문 TR
+        }
+
+        # 주문 데이터 (시장가)
+        body = {
+            "dmst_stex_tp": "KRX",     # 거래소 구분
+            "stk_cd": stock_code,      # 종목코드
+            "ord_qty": str(quantity),  # 주문 수량
+            "ord_uv": "",              # 주문 단가 (시장가는 빈값)
+            "trde_tp": "3",            # 매매 구분 (3: 시장가)
+            "cond_uv": ""              # 조건 단가
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=body)
+            response.raise_for_status()
+
+            result = response.json()
+
+            ord_no = result.get("ord_no", "")
+            dmst_stex_tp = result.get("dmst_stex_tp", "")
+
+            if ord_no:
+                logger.info(f"✅ 시장가 매도 주문 성공! (손절)")
+                logger.info(f"종목코드: {stock_code}")
+                logger.info(f"주문수량: {quantity}주")
+                logger.info(f"주문번호: {ord_no}")
+
+                return {
+                    "success": True,
+                    "order_no": ord_no,
+                    "stock_code": stock_code,
+                    "quantity": quantity,
+                    "order_type": "시장가 매도 (손절)",
+                    "exchange": dmst_stex_tp,
+                    "message": "손절 매도 주문이 완료되었습니다"
+                }
+            else:
+                logger.error(f"❌ 시장가 매도 주문 실패")
+                logger.error(f"응답: {result}")
+                return {
+                    "success": False,
+                    "message": f"매도 주문 실패: {result}",
+                    "stock_code": stock_code,
+                    "quantity": quantity
+                }
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ 시장가 매도 주문 요청 실패: {e}")
+            return {
+                "success": False,
+                "message": str(e),
+                "stock_code": stock_code,
+                "quantity": quantity
+            }
+
     def get_current_price(self, stock_code: str) -> Dict:
         """
         현재가 조회 (ka10001 - 주식현재가)
