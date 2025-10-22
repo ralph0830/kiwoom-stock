@@ -5,6 +5,7 @@
 """
 
 import os
+import re
 import requests
 from datetime import datetime
 from typing import Dict, Optional
@@ -78,7 +79,8 @@ class KiwoomOrderAPI:
         self,
         stock_code: str,
         quantity: int,
-        account_no: str
+        account_no: str,
+        retry_on_insufficient_funds: bool = True
     ) -> Dict:
         """
         시장가 매수 주문
@@ -87,6 +89,7 @@ class KiwoomOrderAPI:
             stock_code: 종목코드 (6자리)
             quantity: 매수 수량
             account_no: 계좌번호 (사용하지 않음 - 토큰에 포함됨)
+            retry_on_insufficient_funds: 증거금 부족 시 자동 재시도 여부 (기본: True)
 
         Returns:
             주문 결과 딕셔너리
@@ -139,6 +142,26 @@ class KiwoomOrderAPI:
                     "message": "주문이 완료되었습니다"
                 }
             else:
+                # 증거금 부족 에러 처리
+                return_msg = result.get("return_msg", "")
+                return_code = result.get("return_code")
+
+                # 증거금 부족 에러인지 확인하고 매수 가능 수량 추출
+                if retry_on_insufficient_funds and return_code == 20:
+                    available_qty = self._parse_available_quantity(return_msg)
+
+                    if available_qty and available_qty > 0 and available_qty < quantity:
+                        logger.warning(f"⚠️ 증거금 부족! 요청 수량: {quantity}주, 매수 가능: {available_qty}주")
+                        logger.info(f"🔄 매수 가능 수량({available_qty}주)으로 재시도합니다...")
+
+                        # 매수 가능 수량으로 재귀 호출 (재시도 방지 플래그 전달)
+                        return self.place_market_buy_order(
+                            stock_code=stock_code,
+                            quantity=available_qty,
+                            account_no=account_no,
+                            retry_on_insufficient_funds=False  # 재시도 방지
+                        )
+
                 logger.error(f"❌ 시장가 매수 주문 실패")
                 logger.error(f"응답: {result}")
                 return {
@@ -156,6 +179,28 @@ class KiwoomOrderAPI:
                 "stock_code": stock_code,
                 "quantity": quantity
             }
+
+    def _parse_available_quantity(self, error_message: str) -> int | None:
+        """
+        에러 메시지에서 매수 가능 수량 파싱
+
+        예: '[2000](855056:매수증거금이 부족합니다. 777주 매수가능)' -> 777
+
+        Args:
+            error_message: API 에러 메시지
+
+        Returns:
+            매수 가능 수량 또는 None
+        """
+        # 정규표현식으로 "숫자주 매수가능" 패턴 추출
+        match = re.search(r'(\d+)주\s*매수가능', error_message)
+
+        if match:
+            available_qty = int(match.group(1))
+            logger.info(f"📊 매수 가능 수량 파싱: {available_qty}주")
+            return available_qty
+
+        return None
 
     def place_limit_buy_order(
         self,
