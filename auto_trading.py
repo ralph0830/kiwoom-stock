@@ -135,6 +135,17 @@ class AutoTradingSystem:
         else:
             logger.info("⏸️  손절 모니터링이 비활성화되었습니다 (ENABLE_STOP_LOSS=false)")
 
+        # 일일 강제 청산 활성화 여부 (환경변수에서 읽기)
+        self.enable_daily_force_sell = os.getenv("ENABLE_DAILY_FORCE_SELL", "true").lower() == "true"
+
+        # 일일 강제 청산 시간 환경변수에서 읽기 (기본값: 15:19)
+        self.daily_force_sell_time = os.getenv("DAILY_FORCE_SELL_TIME", "15:19")
+
+        if self.enable_daily_force_sell:
+            logger.info(f"⏰ 일일 강제 청산 활성화: {self.daily_force_sell_time}에 100% 전량 시장가 매도")
+        else:
+            logger.info("⏸️  일일 강제 청산이 비활성화되었습니다 (ENABLE_DAILY_FORCE_SELL=false)")
+
     def check_today_trading_done(self) -> bool:
         """
         오늘 이미 매수했는지 확인
@@ -512,6 +523,11 @@ class AutoTradingSystem:
                 logger.info("=" * 80)
                 self._last_profit_log = datetime.now()
 
+        # 강제 청산 시간 체크 (최우선 - 손절/익절보다 우선)
+        if self.enable_daily_force_sell and self.is_force_sell_time() and not self.sell_executed:
+            await self.execute_daily_force_sell()
+            return
+
         # 손절 조건 체크 (손절이 목표 수익률보다 우선)
         if self.enable_stop_loss and profit_rate <= self.stop_loss_rate and not self.sell_executed:
             await self.execute_stop_loss(current_price, profit_rate)
@@ -684,6 +700,80 @@ class AutoTradingSystem:
         except Exception as e:
             logger.error(f"❌ 손절 주문 실행 중 오류: {e}")
 
+    async def execute_daily_force_sell(self):
+        """일일 강제 청산 실행 (100% 전량 시장가 매도)"""
+        # 중복 매도 방지
+        if self.sell_executed:
+            logger.warning("⚠️ 이미 매도 주문을 실행했습니다. 중복 실행 방지")
+            return
+
+        self.sell_executed = True  # 즉시 플래그 설정 (중복 방지)
+
+        logger.info("=" * 80)
+        logger.info(f"⏰ 강제 청산 시간 도달! ({self.daily_force_sell_time})")
+        logger.info(f"💰 보유 종목을 100% 전량 시장가 매도합니다")
+        logger.info("=" * 80)
+
+        # 실제 보유 수량 및 평균 매입단가 조회
+        logger.info("📊 계좌 잔고에서 실제 보유 수량을 조회합니다...")
+        balance_result = self.kiwoom_api.get_account_balance()
+
+        actual_quantity = self.buy_info["quantity"]  # 기본값
+        actual_buy_price = self.buy_info["buy_price"]  # 기본값
+
+        if balance_result.get("success"):
+            holdings = balance_result.get("holdings", [])
+            # 해당 종목 찾기
+            for holding in holdings:
+                if holding.get("stock_code") == self.buy_info["stock_code"]:
+                    actual_quantity = holding.get("quantity", self.buy_info["quantity"])
+                    actual_buy_price = holding.get("avg_price", self.buy_info["buy_price"])
+                    logger.info(f"✅ 실제 보유 정보 확인:")
+                    logger.info(f"   보유 수량: {actual_quantity}주")
+                    logger.info(f"   평균 매입단가: {actual_buy_price:,}원")
+                    break
+            else:
+                logger.warning(f"⚠️ 계좌 잔고에서 종목을 찾을 수 없습니다. 기본값 사용 (수량: {actual_quantity}주)")
+        else:
+            logger.warning(f"⚠️ 계좌 잔고 조회 실패. 기본값 사용 (수량: {actual_quantity}주)")
+
+        logger.info(f"💰 강제 청산 수량: {actual_quantity}주 (100% 전량 시장가)")
+
+        try:
+            # 시장가 매도 주문
+            sell_result = self.kiwoom_api.place_market_sell_order(
+                stock_code=self.buy_info["stock_code"],
+                quantity=actual_quantity,
+                account_no=self.account_no
+            )
+
+            if sell_result and sell_result.get("success"):
+                logger.info("✅ 강제 청산 완료!")
+
+                # WebSocket 모니터링 중지
+                if self.websocket:
+                    await self.websocket.unregister_stock(self.buy_info["stock_code"])
+                    if self.ws_receive_task:
+                        self.ws_receive_task.cancel()
+
+                # 현재가 조회 (수익률 계산용)
+                current_price = 0
+                price_result = self.kiwoom_api.get_current_price(self.buy_info["stock_code"])
+                if price_result.get("success"):
+                    current_price = price_result.get("current_price", 0)
+
+                profit_rate = 0
+                if actual_buy_price > 0 and current_price > 0:
+                    profit_rate = (current_price - actual_buy_price) / actual_buy_price
+
+                # 강제 청산 결과 저장
+                await self.save_force_sell_result(current_price, sell_result, profit_rate, actual_quantity, actual_buy_price)
+            else:
+                logger.error("❌ 강제 청산 실패")
+
+        except Exception as e:
+            logger.error(f"❌ 강제 청산 주문 실행 중 오류: {e}")
+
     async def check_and_sell(self, stock_data: dict):
         """
         수익률 확인 및 자동 매도
@@ -844,6 +934,37 @@ class AutoTradingSystem:
 
         logger.info(f"💾 손절 결과 저장: {filename}")
 
+    async def save_force_sell_result(self, current_price: int, order_result: dict, profit_rate: float, actual_quantity: int = None, actual_buy_price: int = None):
+        """강제 청산 결과 저장"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stock_name = self.buy_info["stock_name"].replace("/", "_")
+
+        # 실제 매도 수량
+        sell_quantity = actual_quantity if actual_quantity is not None else self.buy_info["quantity"]
+
+        # 실제 평균 매입단가
+        avg_buy_price = actual_buy_price if actual_buy_price is not None else self.buy_info["buy_price"]
+
+        result = {
+            "timestamp": timestamp,
+            "action": "DAILY_FORCE_SELL",
+            "buy_info": self.buy_info,
+            "actual_avg_buy_price": avg_buy_price,
+            "sell_quantity": sell_quantity,
+            "current_price": current_price,
+            "profit_rate": f"{profit_rate*100:.2f}%",
+            "force_sell_time": self.daily_force_sell_time,
+            "order_result": order_result,
+            "source": "일일 강제 청산"
+        }
+
+        filename = self.result_dir / f"{timestamp}_{stock_name}_강제청산결과.json"
+
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"💾 강제 청산 결과 저장: {filename}")
+
     def is_buy_time_allowed(self) -> bool:
         """
         매수 가능 시간인지 확인 (환경변수 기준)
@@ -868,6 +989,28 @@ class AutoTradingSystem:
             return False
         except ValueError as e:
             logger.error(f"❌ 시간 형식 오류: {e}")
+            return False
+
+    def is_force_sell_time(self) -> bool:
+        """
+        강제 청산 시간인지 확인
+
+        Returns:
+            True: 강제 청산 시간 도달, False: 아직 도달 안함
+        """
+        from datetime import datetime as dt
+
+        now = datetime.now()
+        current_time_str = now.strftime("%H:%M")
+
+        try:
+            current_time = dt.strptime(current_time_str, "%H:%M").time()
+            force_sell_time = dt.strptime(self.daily_force_sell_time, "%H:%M").time()
+
+            # 강제 청산 시간 도달 확인 (이상)
+            return current_time >= force_sell_time
+        except ValueError as e:
+            logger.error(f"❌ 강제 청산 시간 형식 오류: {e}")
             return False
 
     async def monitor_and_trade(self):
