@@ -19,16 +19,43 @@ from kiwoom_websocket import KiwoomWebSocket
 # 환경변수 로드
 load_dotenv()
 
-# 로깅 설정
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('auto_trading.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+# 로깅 설정 (200MB 제한, 최대 3개 백업 파일)
+from logging.handlers import RotatingFileHandler
+
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# 로그 포맷 설정
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+# 콘솔 핸들러 (항상 추가 - fallback 보장)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+# 파일 핸들러 (안전하게 추가 - 실패해도 프로그램 계속 실행)
+try:
+    # 로그 디렉토리 생성 (없으면 자동 생성)
+    import os
+    log_dir = os.path.dirname('auto_trading.log')
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+
+    # 파일 핸들러 생성 (200MB 제한, 최대 3개 백업)
+    file_handler = RotatingFileHandler(
+        'auto_trading.log',
+        maxBytes=200 * 1024 * 1024,  # 200MB
+        backupCount=3,                # 최대 3개 백업 파일 유지
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+except Exception as e:
+    # 로그 파일 생성 실패 시 경고만 출력하고 계속 진행 (콘솔 전용 모드)
+    print(f"⚠️ 로그 파일 생성 실패: {e}")
+    print(f"📝 콘솔 전용 모드로 실행됩니다. 로그는 파일에 저장되지 않습니다.")
+    print(f"💡 해결 방법: 1) 디스크 용량 확인, 2) 파일 쓰기 권한 확인, 3) 다른 프로세스가 로그 파일을 사용 중인지 확인")
 
 
 class AutoTradingSystem:
@@ -824,13 +851,24 @@ class AutoTradingSystem:
         Returns:
             True: 매수 가능 시간, False: 매수 불가 시간
         """
-        now = datetime.now()
-        current_time = now.strftime("%H:%M")
+        from datetime import datetime as dt
 
-        # 환경변수에서 읽은 시간 기준으로 매수 가능 여부 확인
-        if self.buy_start_time <= current_time < self.buy_end_time:
-            return True
-        return False
+        now = datetime.now()
+        current_time_str = now.strftime("%H:%M")
+
+        # 시간 문자열을 datetime 객체로 변환하여 정확한 비교
+        try:
+            current_time = dt.strptime(current_time_str, "%H:%M").time()
+            start_time = dt.strptime(self.buy_start_time, "%H:%M").time()
+            end_time = dt.strptime(self.buy_end_time, "%H:%M").time()
+
+            # 시간 범위 확인
+            if start_time <= current_time < end_time:
+                return True
+            return False
+        except ValueError as e:
+            logger.error(f"❌ 시간 형식 오류: {e}")
+            return False
 
     async def monitor_and_trade(self):
         """실시간 모니터링 및 자동 매매"""
