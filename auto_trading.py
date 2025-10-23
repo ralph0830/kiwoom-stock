@@ -81,10 +81,16 @@ class AutoTradingSystem:
         self.order_executed = False
         self.sell_executed = False  # 매도 실행 플래그 (중복 방지)
         self.sell_monitoring = False
+        self.sell_order_no = None  # 매도 주문번호 저장
 
         # 목표 수익률 환경변수에서 읽기 (기본값: 1.0%)
         target_profit_rate_percent = float(os.getenv("TARGET_PROFIT_RATE", "1.0"))
         target_profit_rate = target_profit_rate_percent / 100  # 퍼센트를 소수로 변환
+
+        # 미체결 처리 설정 환경변수에서 읽기
+        self.cancel_outstanding_on_failure = os.getenv("CANCEL_OUTSTANDING_ON_FAILURE", "true").lower() == "true"
+        self.outstanding_check_timeout = int(os.getenv("OUTSTANDING_CHECK_TIMEOUT", "30"))  # 초
+        self.outstanding_check_interval = int(os.getenv("OUTSTANDING_CHECK_INTERVAL", "5"))  # 초
 
         # 매수 정보 저장
         self.buy_info = {
@@ -613,21 +619,142 @@ class AutoTradingSystem:
             )
 
             if sell_result and sell_result.get("success"):
-                logger.info("✅ 자동 매도 완료!")
+                # 주문번호 저장
+                self.sell_order_no = sell_result.get("order_no")
+                logger.info(f"✅ 지정가 매도 주문 접수! 주문번호: {self.sell_order_no}")
+                logger.info(f"⏳ 체결 확인 중... (최대 {self.outstanding_check_timeout}초 대기)")
 
-                # WebSocket 모니터링 중지
-                if self.websocket:
-                    await self.websocket.unregister_stock(self.buy_info["stock_code"])
-                    if self.ws_receive_task:
-                        self.ws_receive_task.cancel()
+                # 체결 확인 대기
+                is_executed = await self.wait_for_sell_execution(
+                    order_no=self.sell_order_no,
+                    current_price=current_price,
+                    profit_rate=profit_rate,
+                    actual_quantity=actual_quantity,
+                    actual_buy_price=actual_buy_price
+                )
 
-                # 매도 결과 저장 (실제 매도 수량 및 평균 매입단가 반영)
-                await self.save_sell_result_ws(current_price, sell_result, profit_rate, actual_quantity, actual_buy_price)
+                if is_executed:
+                    logger.info("✅ 자동 매도 완료!")
+
+                    # WebSocket 모니터링 중지
+                    if self.websocket:
+                        await self.websocket.unregister_stock(self.buy_info["stock_code"])
+                        if self.ws_receive_task:
+                            self.ws_receive_task.cancel()
+
+                    # 매도 결과 저장
+                    await self.save_sell_result_ws(current_price, sell_result, profit_rate, actual_quantity, actual_buy_price)
+                else:
+                    # 미체결 시 처리
+                    await self.handle_outstanding_order(
+                        order_no=self.sell_order_no,
+                        stock_code=self.buy_info["stock_code"],
+                        quantity=actual_quantity
+                    )
             else:
                 logger.error("❌ 자동 매도 실패")
+                self.sell_executed = False  # 주문 실패 시 플래그 해제 (재시도 가능)
 
         except Exception as e:
             logger.error(f"❌ 매도 주문 실행 중 오류: {e}")
+            self.sell_executed = False  # 오류 시 플래그 해제
+
+    async def wait_for_sell_execution(
+        self,
+        order_no: str,
+        current_price: int,
+        profit_rate: float,
+        actual_quantity: int,
+        actual_buy_price: int
+    ) -> bool:
+        """
+        매도 주문 체결 대기 및 확인
+
+        Args:
+            order_no: 주문번호
+            current_price: 현재가
+            profit_rate: 수익률
+            actual_quantity: 실제 매도 수량
+            actual_buy_price: 실제 평균 매입단가
+
+        Returns:
+            체결 완료 여부 (True: 체결 완료, False: 미체결)
+        """
+        elapsed_time = 0
+        check_count = 0
+
+        while elapsed_time < self.outstanding_check_timeout:
+            await asyncio.sleep(self.outstanding_check_interval)
+            elapsed_time += self.outstanding_check_interval
+            check_count += 1
+
+            logger.info(f"🔍 체결 확인 {check_count}회차 (경과: {elapsed_time}초/{self.outstanding_check_timeout}초)")
+
+            # 체결 여부 확인
+            execution_result = self.kiwoom_api.check_order_execution(order_no)
+
+            if not execution_result.get("success"):
+                logger.warning(f"⚠️ 체결 확인 실패: {execution_result.get('message', '알 수 없는 오류')}")
+                continue
+
+            if execution_result.get("is_executed"):
+                logger.info(f"✅ 매도 주문 체결 완료! (소요 시간: {elapsed_time}초)")
+                return True
+            else:
+                remaining_qty = execution_result.get("remaining_qty", 0)
+                logger.info(f"⏳ 아직 미체결 상태입니다 (미체결 수량: {remaining_qty}주)")
+
+        # 타임아웃
+        logger.warning(f"⚠️ 체결 확인 타임아웃 ({self.outstanding_check_timeout}초 경과)")
+        return False
+
+    async def handle_outstanding_order(
+        self,
+        order_no: str,
+        stock_code: str,
+        quantity: int
+    ):
+        """
+        미체결 주문 처리 (취소 또는 유지)
+
+        Args:
+            order_no: 주문번호
+            stock_code: 종목코드
+            quantity: 주문 수량
+        """
+        logger.info("=" * 80)
+        logger.info("⚠️ 매도 주문이 체결되지 않았습니다!")
+        logger.info(f"주문번호: {order_no}")
+        logger.info(f"종목코드: {stock_code}")
+        logger.info(f"주문수량: {quantity}주")
+
+        if self.cancel_outstanding_on_failure:
+            logger.info("🔄 미체결 주문 취소 후 재모니터링을 시작합니다...")
+
+            # 주문 취소
+            cancel_result = self.kiwoom_api.cancel_order(
+                order_no=order_no,
+                stock_code=stock_code,
+                quantity=quantity
+            )
+
+            if cancel_result.get("success"):
+                logger.info("✅ 미체결 주문 취소 완료!")
+                logger.info("📈 실시간 시세 모니터링을 계속합니다...")
+
+                # 플래그 해제하여 재매도 가능하게
+                self.sell_executed = False
+                self.sell_order_no = None
+            else:
+                logger.error(f"❌ 주문 취소 실패: {cancel_result.get('message', '알 수 없는 오류')}")
+                logger.info("📈 주문은 유지되며, 실시간 시세 모니터링을 계속합니다...")
+                # 플래그는 유지 (중복 주문 방지)
+        else:
+            logger.info("📌 미체결 주문을 유지하고 실시간 시세 모니터링을 계속합니다...")
+            logger.info("💡 .env의 CANCEL_OUTSTANDING_ON_FAILURE=true로 설정하면 자동 취소됩니다")
+            # 플래그는 유지 (중복 주문 방지)
+
+        logger.info("=" * 80)
 
     async def execute_stop_loss(self, current_price: int, profit_rate: float):
         """손절 실행 (시장가 즉시 매도)"""
@@ -712,6 +839,44 @@ class AutoTradingSystem:
         logger.info("=" * 80)
         logger.info(f"⏰ 강제 청산 시간 도달! ({self.daily_force_sell_time})")
         logger.info(f"💰 보유 종목을 100% 전량 시장가 매도합니다")
+        logger.info("=" * 80)
+
+        # 1단계: 미체결 주문 확인 및 취소
+        logger.info("🔍 강제 청산 전 미체결 주문 확인 중...")
+        outstanding_result = self.kiwoom_api.get_outstanding_orders()
+
+        if outstanding_result.get("success"):
+            outstanding_orders = outstanding_result.get("outstanding_orders", [])
+
+            if outstanding_orders:
+                logger.warning(f"⚠️ 미체결 주문 {len(outstanding_orders)}건 발견!")
+                logger.info("🔄 강제 청산을 위해 모든 미체결 주문을 취소합니다...")
+
+                # 모든 미체결 주문 취소
+                for order in outstanding_orders:
+                    order_no = order.get("ord_no", "")
+                    stock_code = order.get("stk_cd", "")
+                    remaining_qty = int(order.get("rmndr_qty", order.get("ord_qty", "0")))
+
+                    logger.info(f"  ❌ 미체결 주문 취소 중: 주문번호={order_no}, 종목={stock_code}, 수량={remaining_qty}주")
+
+                    cancel_result = self.kiwoom_api.cancel_order(
+                        order_no=order_no,
+                        stock_code=stock_code,
+                        quantity=remaining_qty
+                    )
+
+                    if cancel_result.get("success"):
+                        logger.info(f"  ✅ 주문 취소 완료: {order_no}")
+                    else:
+                        logger.error(f"  ❌ 주문 취소 실패: {order_no} - {cancel_result.get('message', '알 수 없는 오류')}")
+
+                logger.info("✅ 미체결 주문 취소 처리 완료")
+            else:
+                logger.info("✅ 미체결 주문이 없습니다")
+        else:
+            logger.warning("⚠️ 미체결 주문 확인 실패. 강제 청산을 계속 진행합니다.")
+
         logger.info("=" * 80)
 
         # 실제 보유 수량 및 평균 매입단가 조회
@@ -1186,7 +1351,31 @@ class AutoTradingSystem:
             await self.cleanup()
 
     async def cleanup(self):
-        """리소스 정리"""
+        """리소스 정리 (종료 전 미체결 확인)"""
+        logger.info("=" * 80)
+        logger.info("🔍 종료 전 미체결 주문 확인 중...")
+
+        # 미체결 주문 확인
+        outstanding_result = self.kiwoom_api.get_outstanding_orders()
+
+        if outstanding_result.get("success"):
+            outstanding_orders = outstanding_result.get("outstanding_orders", [])
+
+            if outstanding_orders:
+                logger.warning(f"⚠️ 미체결 주문이 {len(outstanding_orders)}건 존재합니다!")
+                logger.warning("⚠️ 시스템을 종료하지 않고 계속 모니터링합니다.")
+                logger.warning("💡 미체결 주문이 모두 체결되면 자동으로 종료됩니다.")
+                logger.info("=" * 80)
+
+                # 미체결이 있으면 종료하지 않고 대기
+                # (WebSocket 모니터링은 계속 유지)
+                return
+            else:
+                logger.info("✅ 미체결 주문이 없습니다. 안전하게 종료합니다.")
+        else:
+            logger.warning("⚠️ 미체결 주문 확인 실패. 강제 종료합니다.")
+
+        logger.info("=" * 80)
         logger.info("리소스 정리 중...")
 
         # WebSocket 종료

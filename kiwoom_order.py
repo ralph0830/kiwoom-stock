@@ -599,6 +599,199 @@ class KiwoomOrderAPI:
                 "message": str(e)
             }
 
+    def get_outstanding_orders(self, query_date: str = None) -> Dict:
+        """
+        미체결 주문 조회 (ka10075)
+
+        Args:
+            query_date: 조회일자 (YYYYMMDD 형식, 기본값: 오늘)
+
+        Returns:
+            미체결 주문 목록 딕셔너리
+        """
+        if not self.access_token:
+            self.get_access_token()
+
+        # 조회일자가 없으면 오늘 날짜 사용
+        if not query_date:
+            query_date = datetime.now().strftime("%Y%m%d")
+
+        url = f"{self.base_url}/api/dostk/acnt"
+
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {self.access_token}",
+            "api-id": "ka10075",  # 미체결요청 TR
+        }
+
+        # JSON body로 전송
+        body = {
+            "qry_dt": query_date
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=body)
+            response.raise_for_status()
+
+            result = response.json()
+
+            # 미체결 주문 리스트 추출 (실제 필드명은 API 응답에 따라 조정 필요)
+            # 예상 필드명: outstanding_orders, unexecuted_orders, 또는 특정 키
+            outstanding_orders = result.get("outstanding_orders", result.get("orders", []))
+
+            if outstanding_orders:
+                logger.info(f"⚠️ 미체결 주문 {len(outstanding_orders)}건 발견")
+
+                # 미체결 주문 정보 로깅
+                for order in outstanding_orders:
+                    ord_no = order.get("ord_no", "")
+                    stock_code = order.get("stk_cd", "")
+                    stock_name = order.get("stk_nm", "")
+                    ord_qty = order.get("ord_qty", "0")
+                    rmndr_qty = order.get("rmndr_qty", ord_qty)  # 미체결수량
+                    ord_uv = order.get("ord_uv", "0")
+
+                    logger.info(f"  📋 주문번호: {ord_no}, 종목: {stock_name}({stock_code}), 미체결수량: {rmndr_qty}주, 주문가: {ord_uv}원")
+
+                return {
+                    "success": True,
+                    "outstanding_orders": outstanding_orders,
+                    "total_count": len(outstanding_orders),
+                    "data": result
+                }
+            else:
+                logger.info("✅ 미체결 주문이 없습니다")
+                return {
+                    "success": True,
+                    "outstanding_orders": [],
+                    "total_count": 0,
+                    "data": result
+                }
+
+        except Exception as e:
+            logger.error(f"❌ 미체결 주문 조회 실패: {e}")
+            return {
+                "success": False,
+                "outstanding_orders": [],
+                "message": str(e)
+            }
+
+    def cancel_order(
+        self,
+        order_no: str,
+        stock_code: str,
+        quantity: int
+    ) -> Dict:
+        """
+        주문 취소 (kt10003 - 주식취소주문)
+
+        Args:
+            order_no: 원주문번호
+            stock_code: 종목코드
+            quantity: 취소 수량
+
+        Returns:
+            취소 결과 딕셔너리
+        """
+        if not self.access_token:
+            self.get_access_token()
+
+        url = f"{self.base_url}/api/dostk/ordr"
+
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {self.access_token}",
+            "api-id": "kt10003",  # 주식취소주문 TR
+        }
+
+        # 주문 취소 데이터 (kt10003 스펙)
+        body = {
+            "dmst_stex_tp": "KRX",          # 거래소 구분
+            "orig_ord_no": order_no,        # 원주문번호
+            "stk_cd": stock_code,           # 종목코드
+            "cncl_qty": str(quantity),      # 취소 수량 ('0' 입력 시 잔량 전부 취소)
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=body)
+            response.raise_for_status()
+
+            result = response.json()
+
+            cncl_ord_no = result.get("ord_no", "")
+
+            if cncl_ord_no:
+                logger.info(f"✅ 주문 취소 성공!")
+                logger.info(f"원주문번호: {order_no}")
+                logger.info(f"취소주문번호: {cncl_ord_no}")
+                logger.info(f"취소수량: {quantity}주")
+
+                return {
+                    "success": True,
+                    "cancel_order_no": cncl_ord_no,
+                    "original_order_no": order_no,
+                    "stock_code": stock_code,
+                    "quantity": quantity,
+                    "message": "주문 취소가 완료되었습니다"
+                }
+            else:
+                logger.error(f"❌ 주문 취소 실패")
+                logger.error(f"응답: {result}")
+                return {
+                    "success": False,
+                    "message": f"주문 취소 실패: {result}",
+                    "original_order_no": order_no
+                }
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ 주문 취소 요청 실패: {e}")
+            return {
+                "success": False,
+                "message": str(e),
+                "original_order_no": order_no
+            }
+
+    def check_order_execution(self, order_no: str) -> Dict:
+        """
+        특정 주문번호의 체결 여부 확인
+
+        Args:
+            order_no: 확인할 주문번호
+
+        Returns:
+            체결 상태 딕셔너리
+            - is_executed: 체결 완료 여부
+            - remaining_qty: 미체결 수량 (체결 완료 시 0)
+        """
+        outstanding_result = self.get_outstanding_orders()
+
+        if not outstanding_result["success"]:
+            return {
+                "success": False,
+                "is_executed": False,
+                "message": "미체결 조회 실패"
+            }
+
+        outstanding_orders = outstanding_result["outstanding_orders"]
+
+        # 해당 주문번호가 미체결 목록에 있는지 확인
+        for order in outstanding_orders:
+            if order.get("ord_no") == order_no:
+                remaining_qty = int(order.get("rmndr_qty", order.get("ord_qty", "0")))
+                return {
+                    "success": True,
+                    "is_executed": False,
+                    "remaining_qty": remaining_qty,
+                    "order_info": order
+                }
+
+        # 미체결 목록에 없으면 체결 완료
+        return {
+            "success": True,
+            "is_executed": True,
+            "remaining_qty": 0
+        }
+
     def calculate_order_quantity(
         self,
         buy_price: int,
