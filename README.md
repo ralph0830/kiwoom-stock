@@ -10,10 +10,13 @@
 
 - 🔍 **실시간 종목 스크래핑**: Playwright를 이용한 장 시작 후 실시간 모니터링 (09:00~09:10)
 - 📊 **자동 매수**: 매수 조건 충족 시 시장가 주문 자동 실행
-- 💰 **자동 매도**: 목표 수익률 도달 시 자동 매도 (환경변수로 설정 가능, 기본값: 1.0%)
+- 💰 **자동 익절**: 목표 수익률 도달 시 지정가 자동 매도 (환경변수로 설정 가능, 기본값: 1.0%)
+- 🚨 **자동 손절**: 손절 수익률 도달 시 시장가 즉시 매도 (기본값: -2.5%)
+- ⏰ **일일 강제 청산**: 지정 시간(15:19)에 수익/손실 관계없이 100% 전량 시장가 매도
 - 🔄 **무한 연결 유지**: WebSocket PING/PONG 처리로 연결 끊김 없음
-- 🛡️ **안전장치**: 일일 1회 매수 제한, 중복 매도 방지
+- 🛡️ **안전장치**: 일일 1회 매수 제한, 중복 매도 방지, 미체결 주문 관리
 - 📱 **브라우저 독립**: 매수 후 브라우저 없이도 매도 모니터링 가능
+- ✅ **체결 확인**: 매도 주문 후 자동 체결 확인 및 미체결 시 처리
 
 ## 🚀 빠른 시작
 
@@ -58,6 +61,19 @@ BUY_END_TIME=09:10           # 매수 종료 시간
 
 # 매도 모니터링 설정
 ENABLE_SELL_MONITORING=true  # 자동 매도 모니터링 활성화 (true: 활성화, false: 비활성화)
+
+# 손절 설정
+ENABLE_STOP_LOSS=true        # 손절 모니터링 활성화 (true: 활성화, false: 비활성화)
+STOP_LOSS_RATE=-2.5          # 손절 수익률 (%) - 기본값: -2.5%
+
+# 일일 강제 청산 설정
+ENABLE_DAILY_FORCE_SELL=true     # 일일 강제 청산 활성화 (true: 활성화, false: 비활성화)
+DAILY_FORCE_SELL_TIME=15:19      # 강제 청산 시간 (기본값: 15:19 - 장마감 11분 전)
+
+# 미체결 주문 처리 설정
+CANCEL_OUTSTANDING_ON_FAILURE=true   # 미체결 시 주문 취소 여부 (true: 취소 후 재모니터링, false: 주문 유지하고 재모니터링)
+OUTSTANDING_CHECK_TIMEOUT=30         # 체결 확인 타임아웃 (초) - 기본값: 30초
+OUTSTANDING_CHECK_INTERVAL=5         # 체결 확인 주기 (초) - 기본값: 5초
 ```
 
 ### 3. 실행
@@ -86,7 +102,11 @@ python auto_trading.py
 
 3. **매도 모니터링** (무제한)
    - WebSocket 실시간 시세 수신
-   - 목표 수익률 도달 시 자동 매도 (기본값: 1.0%, 설정 가능)
+   - 목표 수익률 도달 시 자동 익절 (지정가, 기본값: 1.0%)
+   - 손절 수익률 도달 시 자동 손절 (시장가, 기본값: -2.5%)
+   - 15:19 도달 시 수익/손실 관계없이 강제 청산 (시장가)
+   - 매도 주문 후 체결 확인 (5초 간격, 최대 30초)
+   - 미체결 시 설정에 따라 취소 또는 유지
 
 ### 재시작 시 (매수 완료 후)
 
@@ -149,7 +169,11 @@ kiwoom-stock/
 - start_auto_trading()        # 브라우저 + WebSocket 매매 시작
 - start_sell_monitoring()     # WebSocket 전용 매도 모니터링
 - execute_auto_buy()          # 자동 매수 주문
-- execute_auto_sell()         # 자동 매도 주문
+- execute_auto_sell()         # 자동 익절 (지정가)
+- execute_stop_loss()         # 자동 손절 (시장가)
+- execute_daily_force_sell()  # 일일 강제 청산 (시장가)
+- wait_for_sell_execution()   # 매도 체결 대기 및 확인
+- handle_outstanding_order()  # 미체결 주문 처리
 - on_price_update()           # 실시간 시세 콜백
 ```
 
@@ -160,8 +184,14 @@ REST API를 통한 주문 실행 및 인증을 담당합니다.
 ```python
 # 주요 메서드
 - get_access_token()          # OAuth2 토큰 발급
-- place_market_buy()          # 시장가 매수
-- place_market_sell()         # 시장가 매도
+- place_market_buy_order()    # 시장가 매수 주문
+- place_limit_sell_order()    # 지정가 매도 주문 (익절용)
+- place_market_sell_order()   # 시장가 매도 주문 (손절/강제청산용)
+- get_outstanding_orders()    # 미체결 주문 조회 (ka10075)
+- cancel_order()              # 미체결 주문 취소 (kt10003)
+- check_order_execution()     # 주문 체결 여부 확인
+- get_account_balance()       # 계좌 잔고 조회
+- get_current_price()         # 현재가 조회
 ```
 
 ### KiwoomWebSocket (`kiwoom_websocket.py`)
@@ -196,11 +226,17 @@ WebSocket을 통한 실시간 시세 수신 및 연결 관리를 담당합니다
                 ↓
             [매도 감시]
                 ↓
-            [목표 달성]
-                ↓
-            [매도 실행]
-                ↓
-            [시스템 종료]
+        ┌───────┼───────┐
+        ↓       ↓       ↓
+    [익절]  [손절]  [강제청산]
+        ↓       ↓       ↓
+    [체결확인] [즉시매도] [미체결취소]
+        ↓                   ↓
+    [미체결?]           [시장가매도]
+        ↓                   ↓
+    [취소/유지]         [시스템종료]
+        ↓
+    [재모니터링]
 ```
 
 ## 🛡️ 안전장치
@@ -210,7 +246,7 @@ WebSocket을 통한 실시간 시세 수신 및 연결 관리를 담당합니다
 ```python
 # daily_trading_lock.json으로 날짜 추적
 {
-  "last_trading_date": "20251017",
+  "last_trading_date": "20251023",
   "stock_code": "051780",
   "buy_price": 1625,
   "quantity": 1230
@@ -228,7 +264,33 @@ self.sell_executed = True  # 즉시 플래그 설정
 # 매도 주문 실행
 ```
 
-### 3. WebSocket 연결 안정성
+### 3. 미체결 주문 관리
+
+```python
+# 매도 주문 후 체결 확인
+is_executed = await self.wait_for_sell_execution(order_no)
+
+if not is_executed:
+    # 미체결 시 처리
+    if CANCEL_OUTSTANDING_ON_FAILURE:
+        await self.cancel_order(order_no)  # 취소 후 재모니터링
+    else:
+        # 주문 유지하고 재모니터링
+```
+
+### 4. 강제 청산 안전장치
+
+```python
+# 15:19 도달 시 미체결 주문 자동 취소
+outstanding_orders = get_outstanding_orders()
+for order in outstanding_orders:
+    cancel_order(order_no)  # 모든 미체결 취소
+
+# 100% 전량 시장가 매도
+place_market_sell_order(quantity=actual_quantity)
+```
+
+### 5. WebSocket 연결 안정성
 
 ```python
 # PING 응답 처리
@@ -280,6 +342,18 @@ USE_MOCK=false
 **원인**: PING 메시지 미응답
 
 **해결**: 이미 PING/PONG 처리 구현되어 있음 (kiwoom_websocket.py:171-176)
+
+### 지정가 매도 주문이 미체결되어도 시스템 종료
+
+**원인**: 매도 주문 접수 즉시 완료 처리
+
+**해결**: 체결 확인 로직 추가 (5초 간격, 최대 30초 대기), 미체결 시 취소 또는 유지 선택 가능
+
+### 강제 청산 시 미체결 주문 잔존
+
+**원인**: 강제 청산 전 미체결 주문 확인 없음
+
+**해결**: 15:19 도달 시 모든 미체결 주문 자동 취소 후 시장가 매도
 
 ### 브라우저 닫으면 매도 안됨
 
@@ -416,5 +490,28 @@ MIT License - 자유롭게 사용, 수정, 배포 가능합니다.
 
 **개발**: Ralph
 **도움**: Claude Code
-**마지막 업데이트**: 2025-10-17
-**버전**: 1.0.0
+**마지막 업데이트**: 2025-10-23
+**버전**: 1.2.0
+
+## 📝 변경 이력
+
+### v1.2.0 (2025-10-23)
+- ✨ 미체결 주문 확인 및 처리 기능 추가
+- ✨ 매도 주문 후 자동 체결 확인 (5초 간격, 최대 30초)
+- ✨ 미체결 시 취소 또는 유지 선택 가능
+- ✨ 강제 청산 전 모든 미체결 주문 자동 취소
+- 🔧 `get_outstanding_orders()`, `cancel_order()`, `check_order_execution()` API 추가
+- 🐛 지정가 매도 미체결 시 시스템 종료 문제 해결
+- 🐛 강제 청산 시 미체결 주문 잔존 문제 해결
+
+### v1.1.0 (2025-10-22)
+- ✨ 일일 강제 청산 기능 추가 (15:19 기본값)
+- ✨ 자동 손절 기능 추가 (-2.5% 기본값)
+- 🐛 매수 가능 시간 체크 로직 개선
+- 🐛 증거금 부족 시 매수 가능 수량 자동 재시도
+
+### v1.0.0 (2025-10-17)
+- 🎉 초기 릴리즈
+- ✨ 실시간 종목 스크래핑
+- ✨ 자동 매수/매도
+- ✨ WebSocket 실시간 시세 모니터링
