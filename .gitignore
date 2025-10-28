@@ -19,3 +19,7 @@ stock_data/
 auto_trading.log
 daily_trading_lock.json
 trading_results/
+
+# 종목 추천 시스템
+stock_recommender.log
+recommended_stocks/

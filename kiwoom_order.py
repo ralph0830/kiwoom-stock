@@ -821,6 +821,223 @@ class KiwoomOrderAPI:
 
         return quantity
 
+    def get_realtime_stock_ranking(self, qry_tp: str = '4', cont_yn: str = None, next_key: str = None) -> Dict:
+        """
+        실시간종목조회순위 조회 (ka00198) - 연속조회 지원
+
+        Args:
+            qry_tp: 구분 (1:1분, 2:10분, 3:1시간, 4:당일 누적, 5:30초)
+            cont_yn: 연속조회여부 (Y: 다음 페이지 조회)
+            next_key: 연속조회키 (이전 응답의 next-key 값)
+
+        Returns:
+            {
+                'success': bool,
+                'data': dict,
+                'message': str,
+                'cont_yn': str,  # 다음 페이지 존재 여부
+                'next_key': str  # 다음 페이지 키
+            }
+        """
+        if not self.access_token:
+            self.get_access_token()
+
+        url = f"{self.base_url}/api/dostk/stkinfo"
+
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {self.access_token}",
+            "api-id": "ka00198",  # 실시간종목조회순위
+        }
+
+        # 연속조회 헤더 추가
+        if cont_yn == 'Y' and next_key:
+            headers["cont-yn"] = cont_yn
+            headers["next-key"] = next_key
+
+        body = {
+            "qry_tp": qry_tp
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=body)
+            response.raise_for_status()
+
+            result = response.json()
+
+            if result.get('return_code') == 0:
+                # 응답 헤더에서 연속조회 정보 추출
+                response_headers = response.headers
+                cont_yn_response = response_headers.get('cont-yn', 'N')
+                next_key_response = response_headers.get('next-key', '')
+
+                page_info = f"(페이지: {'다음' if cont_yn == 'Y' else '첫'})"
+                logger.info(f"✅ 실시간종목조회순위 조회 성공 (구분: {qry_tp}) {page_info}")
+
+                return {
+                    "success": True,
+                    "data": result,
+                    "message": result.get('return_msg', '성공'),
+                    "cont_yn": cont_yn_response,
+                    "next_key": next_key_response
+                }
+            else:
+                logger.error(f"❌ 실시간종목조회순위 조회 실패: {result}")
+                return {
+                    "success": False,
+                    "data": {},
+                    "message": result.get('return_msg', '알 수 없는 오류'),
+                    "cont_yn": "N",
+                    "next_key": ""
+                }
+
+        except Exception as e:
+            logger.error(f"❌ 실시간종목조회순위 조회 실패: {e}")
+            return {
+                "success": False,
+                "data": {},
+                "message": str(e),
+                "cont_yn": "N",
+                "next_key": ""
+            }
+
+    def get_daily_chart(self, stock_code: str, period: int = 120, base_dt: str = None) -> Dict:
+        """
+        주식일봉차트 조회 (ka10081)
+
+        Args:
+            stock_code: 종목코드
+            period: 조회 기간 (일 수, 기본 120일)
+            base_dt: 기준일자 (YYYYMMDD, 기본값: 오늘 날짜)
+
+        Returns:
+            {
+                'success': bool,
+                'data': list,  # 일봉 데이터 리스트
+                'message': str
+            }
+        """
+        if not self.access_token:
+            self.get_access_token()
+
+        # base_dt가 없으면 오늘 날짜 사용
+        if base_dt is None:
+            from datetime import datetime
+            base_dt = datetime.now().strftime("%Y%m%d")
+
+        url = f"{self.base_url}/api/dostk/chart"
+
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {self.access_token}",
+            "api-id": "ka10081",  # 주식일봉차트조회요청
+        }
+
+        body = {
+            "stk_cd": stock_code,
+            "base_dt": base_dt,  # 기준일자 (필수, YYYYMMDD)
+            "upd_stkpc_tp": "1"  # 수정주가구분 (필수, 0: 무수정, 1: 수정주가)
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=body)
+            response.raise_for_status()
+
+            result = response.json()
+
+            if result.get('return_code') == 0:
+                # 실제 API 응답 필드: stk_dt_pole_chart_qry
+                chart_data = result.get('stk_dt_pole_chart_qry', [])
+
+                # period 개수만큼 자르기 (최신순으로 정렬되어 있음)
+                chart_data = chart_data[:period] if len(chart_data) > period else chart_data
+
+                logger.info(f"✅ [{stock_code}] 일봉 차트 조회 성공 ({len(chart_data)}개)")
+                return {
+                    "success": True,
+                    "data": chart_data,
+                    "message": "성공"
+                }
+            else:
+                logger.error(f"❌ [{stock_code}] 일봉 차트 조회 실패: {result}")
+                return {
+                    "success": False,
+                    "data": [],
+                    "message": result.get('return_msg', '알 수 없는 오류')
+                }
+
+        except Exception as e:
+            logger.error(f"❌ [{stock_code}] 일봉 차트 조회 실패: {e}")
+            return {
+                "success": False,
+                "data": [],
+                "message": str(e)
+            }
+
+    def get_minute_chart(self, stock_code: str, minute: int = 1, period: int = 60) -> Dict:
+        """
+        주식분봉차트 조회 (ka10080)
+
+        Args:
+            stock_code: 종목코드
+            minute: 분봉 단위 (1, 3, 5, 10, 15, 30, 60)
+            period: 조회 개수 (기본 60개)
+
+        Returns:
+            {
+                'success': bool,
+                'data': list,  # 분봉 데이터 리스트
+                'message': str
+            }
+        """
+        if not self.access_token:
+            self.get_access_token()
+
+        url = f"{self.base_url}/api/dostk/chart"
+
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {self.access_token}",
+            "api-id": "ka10080",  # 주식분봉차트조회요청
+        }
+
+        body = {
+            "stk_cd": stock_code,
+            "odr_tp": "1",  # 정순(오름차순)
+            "inq_size": str(period),  # 조회 개수
+            "bng_tp": str(minute)  # 분봉 단위
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=body)
+            response.raise_for_status()
+
+            result = response.json()
+
+            if result.get('return_code') == 0:
+                chart_data = result.get('stk_min_chart', [])
+                logger.info(f"✅ [{stock_code}] {minute}분봉 차트 조회 성공 ({len(chart_data)}개)")
+                return {
+                    "success": True,
+                    "data": chart_data,
+                    "message": "성공"
+                }
+            else:
+                logger.error(f"❌ [{stock_code}] {minute}분봉 차트 조회 실패: {result}")
+                return {
+                    "success": False,
+                    "data": [],
+                    "message": result.get('return_msg', '알 수 없는 오류')
+                }
+
+        except Exception as e:
+            logger.error(f"❌ [{stock_code}] {minute}분봉 차트 조회 실패: {e}")
+            return {
+                "success": False,
+                "data": [],
+                "message": str(e)
+            }
+
 
 def parse_price_string(price_str: str) -> int:
     """

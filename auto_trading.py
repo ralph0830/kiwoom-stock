@@ -15,6 +15,10 @@ import logging
 from dotenv import load_dotenv
 from kiwoom_order import KiwoomOrderAPI, parse_price_string, calculate_sell_price
 from kiwoom_websocket import KiwoomWebSocket
+from rich.console import Console
+from rich.table import Table
+from rich.live import Live
+from rich import box
 
 # 환경변수 로드
 load_dotenv()
@@ -147,10 +151,31 @@ class AutoTradingSystem:
         # 일일 강제 청산 시간 환경변수에서 읽기 (기본값: 15:19)
         self.daily_force_sell_time = os.getenv("DAILY_FORCE_SELL_TIME", "15:19")
 
+        # 실시간 체결 정보 검증 활성화 여부 (환경변수에서 읽기, 기본값: false)
+        self.enable_lazy_verification = os.getenv("ENABLE_LAZY_VERIFICATION", "false").lower() == "true"
+
+        if self.enable_lazy_verification:
+            logger.info("⚙️ 실시간 체결 정보 검증: 활성화 (개선 모드 - 즉시 모니터링 + 자동 업데이트)")
+        else:
+            logger.info("⚙️ 실시간 체결 정보 검증: 비활성화 (기존 모드 - 추정값만 사용)")
+
         if self.enable_daily_force_sell:
             logger.info(f"⏰ 일일 강제 청산 활성화: {self.daily_force_sell_time}에 100% 전량 시장가 매도")
         else:
             logger.info("⏸️  일일 강제 청산이 비활성화되었습니다 (ENABLE_DAILY_FORCE_SELL=false)")
+
+        # Rich Console 초기화
+        self.console = Console()
+        self.live_display = None  # Live 디스플레이 객체
+
+        # 주기적 계좌 조회 설정 (환경변수에서 읽기, 기본값: 30초)
+        self.balance_check_interval = int(os.getenv("BALANCE_CHECK_INTERVAL", "30"))
+        self._last_balance_check = None  # 마지막 계좌 조회 시간
+
+        if self.balance_check_interval > 0:
+            logger.info(f"🔄 주기적 평균단가 업데이트: {self.balance_check_interval}초마다 계좌 조회")
+        else:
+            logger.info("⏸️  주기적 평균단가 업데이트 비활성화 (BALANCE_CHECK_INTERVAL=0)")
 
     def check_today_trading_done(self) -> bool:
         """
@@ -419,8 +444,27 @@ class AutoTradingSystem:
                 account_no=self.account_no
             )
 
+            # 매수 정보 저장 (추정값 또는 개선 모드용 초기값)
+            self.buy_info = {
+                "stock_code": stock_code,
+                "stock_name": stock_name,
+                "buy_price": current_price,  # 추정값 (시장가 주문 시점 현재가)
+                "quantity": quantity,         # 추정값
+                "target_profit_rate": self.buy_info["target_profit_rate"],
+                "is_verified": not self.enable_lazy_verification  # 개선 모드면 False (자동 검증 필요)
+            }
+
             # 결과 저장
             await self.save_trading_result(stock_data, order_result)
+
+            # 매수 완료 로그
+            logger.info("✅ 자동 매수 완료!")
+
+            if self.enable_lazy_verification:
+                logger.info("⚡ 즉시 매도 모니터링을 시작합니다 (추정 매수가 기준)")
+                logger.info("   첫 번째 실시간 시세 수신 시 실제 체결 정보를 자동으로 확인합니다")
+            else:
+                logger.info("📝 추정 매수가로 매도 모니터링을 시작합니다")
 
             return order_result
 
@@ -449,51 +493,80 @@ class AutoTradingSystem:
         except Exception as e:
             logger.error(f"❌ WebSocket 모니터링 시작 실패: {e}")
 
+    def create_price_table(self, current_price: int, buy_price: int, profit_rate: float, source: str = "REST API") -> Table:
+        """실시간 시세 정보 테이블 생성"""
+        table = Table(title=f"📊 실시간 시세 정보 ({source})", box=box.ROUNDED, show_header=False)
+        table.add_column("항목", style="cyan", width=15)
+        table.add_column("값", style="white")
+
+        # 수익률에 따른 색상 결정 (한국 주식시장 관례: 수익=빨강, 손실=파랑)
+        profit_color = "red" if profit_rate >= 0 else "blue"
+        profit_sign = "+" if profit_rate >= 0 else ""
+
+        table.add_row("종목명", self.buy_info['stock_name'])
+        table.add_row("종목코드", self.buy_info['stock_code'])
+        table.add_row("평균 매수가", f"{buy_price:,}원")
+        table.add_row("현재가", f"{current_price:,}원")
+        table.add_row("수익률", f"[{profit_color}]{profit_sign}{profit_rate*100:.2f}%[/{profit_color}] (목표: +{self.buy_info['target_profit_rate']*100:.2f}%)")
+        table.add_row("수익금", f"[{profit_color}]{profit_sign}{(current_price - buy_price) * self.buy_info['quantity']:,}원[/{profit_color}]")
+        table.add_row("보유수량", f"{self.buy_info['quantity']:,}주")
+        table.add_row("업데이트", datetime.now().strftime("%H:%M:%S"))
+
+        return table
+
     async def price_polling_loop(self):
-        """REST API로 1분마다 현재가 조회 (WebSocket 백업)"""
-        logger.info("🔄 REST API 백업 폴링 시작 (1분 대기 후 시작)")
-        await asyncio.sleep(60)  # 첫 1분은 대기 (WebSocket 우선)
+        """REST API로 10초마다 현재가 조회 (WebSocket 백업)"""
+        logger.info("🔄 REST API 백업 폴링 시작 (10초 간격)")
+        await asyncio.sleep(10)  # 첫 10초 대기
 
-        while not self.sell_executed:
-            try:
-                logger.info("📡 REST API로 현재가 조회 중...")
-                # REST API로 현재가 조회
-                result = self.kiwoom_api.get_current_price(self.buy_info["stock_code"])
+        # 콘솔 클리어 (Rich 테이블 시작 전)
+        self.console.clear()
 
-                if result.get("success"):
-                    current_price = result.get("current_price", 0)
+        # 초기 테이블 생성
+        initial_table = self.create_price_table(0, self.buy_info["buy_price"], 0.0, "대기 중")
 
-                    if current_price > 0:
-                        buy_price = self.buy_info["buy_price"]
-                        profit_rate = (current_price - buy_price) / buy_price
+        # Rich Live 디스플레이 시작 (screen=True로 전체 화면 제어)
+        with Live(
+            initial_table,
+            console=self.console,
+            refresh_per_second=4,
+            screen=True
+        ) as live:
+            self.live_display = live
 
-                        # 항상 REST API 조회 결과 출력
-                        logger.info("=" * 80)
-                        logger.info(f"📊 실시간 시세 정보 (REST API)")
-                        logger.info(f"종목명: {self.buy_info['stock_name']}")
-                        logger.info(f"종목코드: {self.buy_info['stock_code']}")
-                        logger.info(f"평균 매수가: {buy_price:,}원")
-                        logger.info(f"현재가: {current_price:,}원")
-                        logger.info(f"수익률: {profit_rate*100:+.2f}% (목표: +{self.buy_info['target_profit_rate']*100:.2f}%)")
-                        logger.info(f"수익금: {(current_price - buy_price) * self.buy_info['quantity']:+,}원")
-                        logger.info("=" * 80)
+            while not self.sell_executed:
+                try:
+                    # REST API로 현재가 조회
+                    result = self.kiwoom_api.get_current_price(self.buy_info["stock_code"])
 
-                        # 목표 수익률 도달 확인
-                        if profit_rate >= self.buy_info["target_profit_rate"]:
-                            logger.info("🎯 REST API로 목표 수익률 도달 확인!")
-                            await self.execute_auto_sell(current_price, profit_rate)
-                            break
+                    if result.get("success"):
+                        current_price = result.get("current_price", 0)
+
+                        if current_price > 0:
+                            buy_price = self.buy_info["buy_price"]
+                            profit_rate = (current_price - buy_price) / buy_price
+
+                            # Rich 테이블로 화면 갱신
+                            table = self.create_price_table(current_price, buy_price, profit_rate, "REST API")
+                            live.update(table)
+
+                            # 목표 수익률 도달 확인
+                            if profit_rate >= self.buy_info["target_profit_rate"]:
+                                logger.info("🎯 REST API로 목표 수익률 도달 확인!")
+                                await self.execute_auto_sell(current_price, profit_rate)
+                                break
+                        else:
+                            logger.warning(f"⚠️ REST API 현재가가 0입니다: {result}")
                     else:
-                        logger.warning(f"⚠️ REST API 현재가가 0입니다: {result}")
-                else:
-                    logger.error(f"❌ REST API 현재가 조회 실패: {result}")
+                        logger.error(f"❌ REST API 현재가 조회 실패: {result}")
 
-            except Exception as e:
-                logger.error(f"❌ 현재가 조회 중 오류: {e}")
+                except Exception as e:
+                    logger.error(f"❌ 현재가 조회 중 오류: {e}")
 
-            # 1분 대기
-            logger.info("⏳ 1분 후 다시 REST API 조회...")
-            await asyncio.sleep(60)
+                # 10초 대기
+                await asyncio.sleep(10)
+
+            self.live_display = None
 
     async def on_price_update(self, stock_code: str, current_price: int, data: dict):
         """
@@ -507,26 +580,129 @@ class AutoTradingSystem:
         if current_price <= 0:
             return
 
+        # ⭐ Lazy Verification: 첫 시세 수신 시 실제 체결 정보 확인
+        if self.enable_lazy_verification and not self.buy_info.get("is_verified", False):
+            logger.info("🔄 실제 체결 정보를 확인합니다...")
+
+            try:
+                balance_result = self.kiwoom_api.get_account_balance()
+
+                if balance_result.get("success"):
+                    holdings = balance_result.get("holdings", [])
+
+                    # 해당 종목 찾기
+                    for holding in holdings:
+                        if holding.get("stk_cd") == stock_code:
+                            actual_price = int(holding.get("buy_uv") or 0)  # 평균 매입단가
+                            actual_quantity = int(holding.get("rmnd_qty") or 0)  # 보유 수량
+
+                            if actual_price > 0 and actual_quantity > 0:
+                                # 추정값과 비교
+                                price_diff = actual_price - self.buy_info["buy_price"]
+                                quantity_diff = actual_quantity - self.buy_info["quantity"]
+
+                                # 실제 체결 정보로 업데이트
+                                self.buy_info["buy_price"] = actual_price
+                                self.buy_info["quantity"] = actual_quantity
+                                self.buy_info["is_verified"] = True
+
+                                # 파일에도 실제값 저장
+                                self.record_today_trading(
+                                    stock_code=stock_code,
+                                    stock_name=self.buy_info["stock_name"],
+                                    buy_price=actual_price,
+                                    quantity=actual_quantity
+                                )
+
+                                logger.info("✅ 실제 체결 정보 확인 완료!")
+                                logger.info(f"   실제 평균 매입단가: {actual_price:,}원 (예상 대비 {price_diff:+,}원)")
+                                logger.info(f"   실제 체결 수량: {actual_quantity:,}주 (예상 대비 {quantity_diff:+,}주)")
+                                logger.info(f"   실제 투자금액: {actual_price * actual_quantity:,}원")
+                            break
+                    else:
+                        logger.warning("⚠️ 계좌에서 해당 종목을 찾을 수 없습니다. 추정값으로 계속 진행합니다.")
+                        self.buy_info["is_verified"] = True  # 재시도 방지
+                else:
+                    logger.warning("⚠️ 계좌 조회 실패! 추정값으로 계속 진행합니다.")
+                    self.buy_info["is_verified"] = True  # 재시도 방지
+
+            except Exception as e:
+                logger.error(f"❌ 체결 정보 확인 중 오류: {e}")
+                self.buy_info["is_verified"] = True  # 실패 시에도 플래그 설정 (무한 재시도 방지)
+
         buy_price = self.buy_info["buy_price"]
         if buy_price <= 0:
             return
+
+        # ⭐ 주기적 계좌 조회 (수동 매수 대응)
+        if self.balance_check_interval > 0:
+            now = datetime.now()
+            should_check_balance = (
+                self._last_balance_check is None or
+                (now - self._last_balance_check).total_seconds() >= self.balance_check_interval
+            )
+
+            if should_check_balance:
+                try:
+                    balance_result = self.kiwoom_api.get_account_balance()
+
+                    if balance_result.get("success"):
+                        holdings = balance_result.get("holdings", [])
+
+                        for holding in holdings:
+                            if holding.get("stk_cd") == stock_code:
+                                actual_buy_price = int(holding.get("buy_uv") or 0)
+                                actual_quantity = int(holding.get("rmnd_qty") or 0)
+
+                                # 평균 매입단가 또는 수량 변경 감지
+                                if actual_buy_price > 0 and (
+                                    actual_buy_price != self.buy_info["buy_price"] or
+                                    actual_quantity != self.buy_info["quantity"]
+                                ):
+                                    old_price = self.buy_info["buy_price"]
+                                    old_quantity = self.buy_info["quantity"]
+
+                                    # 업데이트
+                                    self.buy_info["buy_price"] = actual_buy_price
+                                    self.buy_info["quantity"] = actual_quantity
+
+                                    # 파일에도 저장
+                                    self.record_today_trading(
+                                        stock_code=stock_code,
+                                        stock_name=self.buy_info["stock_name"],
+                                        buy_price=actual_buy_price,
+                                        quantity=actual_quantity
+                                    )
+
+                                    logger.warning("=" * 80)
+                                    logger.warning("🔄 수동 매수 감지! 평균 매입단가 업데이트")
+                                    logger.warning(f"   평균 매입단가: {old_price:,}원 → {actual_buy_price:,}원 ({actual_buy_price - old_price:+,}원)")
+                                    logger.warning(f"   보유 수량: {old_quantity:,}주 → {actual_quantity:,}주 ({actual_quantity - old_quantity:+,}주)")
+                                    logger.warning(f"   투자금액: {old_price * old_quantity:,}원 → {actual_buy_price * actual_quantity:,}원")
+                                    logger.warning("=" * 80)
+
+                                    # buy_price 재설정 (수익률 계산용)
+                                    buy_price = actual_buy_price
+                                break
+
+                    self._last_balance_check = now
+
+                except Exception as e:
+                    logger.error(f"❌ 주기적 계좌 조회 중 오류: {e}")
+                    self._last_balance_check = now  # 오류 시에도 타이머 리셋
 
         # 현재 수익률 계산
         profit_rate = (current_price - buy_price) / buy_price
 
         # DEBUG 모드일 때만 실시간 시세 출력
         if self.debug_mode:
-            # 로그 출력 (1초마다)
-            if not hasattr(self, '_last_profit_log') or (datetime.now() - self._last_profit_log).seconds >= 1:
-                logger.info("=" * 80)
-                logger.info(f"📊 실시간 시세 정보 (WebSocket)")
-                logger.info(f"종목명: {self.buy_info['stock_name']}")
-                logger.info(f"종목코드: {stock_code}")
-                logger.info(f"평균 매수가: {buy_price:,}원")
-                logger.info(f"현재가: {current_price:,}원")
-                logger.info(f"수익률: {profit_rate*100:+.2f}% (목표: +{self.buy_info['target_profit_rate']*100:.2f}%, 손절: {self.stop_loss_rate*100:.2f}%)")
-                logger.info(f"수익금: {(current_price - buy_price) * self.buy_info['quantity']:+,}원")
-                logger.info("=" * 80)
+            # Rich 테이블로 화면 갱신 (1초마다)
+            if not hasattr(self, '_last_profit_log') or (datetime.now() - self._last_profit_log).total_seconds() >= 1:
+                # Live 디스플레이가 활성화되어 있으면 테이블 갱신
+                if self.live_display:
+                    table = self.create_price_table(current_price, buy_price, profit_rate, "WebSocket")
+                    self.live_display.update(table)
+
                 self._last_profit_log = datetime.now()
 
         # 강제 청산 시간 체크 (최우선 - 손절/익절보다 우선)
@@ -536,11 +712,13 @@ class AutoTradingSystem:
 
         # 손절 조건 체크 (손절이 목표 수익률보다 우선)
         if self.enable_stop_loss and profit_rate <= self.stop_loss_rate and not self.sell_executed:
+            # 캐시된 평균단가로 즉시 손절 실행 (180ms 절약)
             await self.execute_stop_loss(current_price, profit_rate)
             return
 
         # 목표 수익률 도달 확인
         if profit_rate >= self.buy_info["target_profit_rate"] and not self.sell_executed:
+            # 캐시된 평균단가로 즉시 익절 실행 (180ms 절약)
             await self.execute_auto_sell(current_price, profit_rate)
 
     async def execute_auto_sell(self, current_price: int, profit_rate: float):
@@ -559,50 +737,17 @@ class AutoTradingSystem:
         logger.info(f"수익률: {profit_rate*100:.2f}%")
         logger.info("=" * 60)
 
-        # 실제 보유 수량 및 평균 매입단가 조회 (100% 전량 매도를 위해)
-        logger.info("📊 계좌 잔고에서 실제 보유 정보를 조회합니다...")
-        balance_result = self.kiwoom_api.get_account_balance()
+        # 캐시된 보유 정보 사용 (180ms 절약, 수동 매수 시 재시작 필요)
+        actual_quantity = self.buy_info["quantity"]
+        actual_buy_price = self.buy_info["buy_price"]
 
-        actual_quantity = self.buy_info["quantity"]  # 기본값 (잔고 조회 실패 시 사용)
-        actual_buy_price = self.buy_info["buy_price"]  # 기본값
-
-        if balance_result.get("success"):
-            holdings = balance_result.get("holdings", [])
-            # 해당 종목 찾기
-            for holding in holdings:
-                if holding.get("stk_cd") == self.buy_info["stock_code"]:
-                    actual_quantity = int(holding.get("rmnd_qty") or 0)
-                    actual_buy_price = int(holding.get("buy_uv") or 0)  # 평균 매입단가
-
-                    logger.info(f"✅ 실제 보유 정보 확인:")
-                    logger.info(f"   보유 수량: {actual_quantity}주")
-                    logger.info(f"   평균 매입단가: {actual_buy_price:,}원")
-
-                    # 보유 수량이 저장된 수량과 다르면 경고 (수동 매수 포함)
-                    if actual_quantity != self.buy_info["quantity"]:
-                        logger.warning(f"⚠️ 보유 수량이 기록과 다릅니다! 기록: {self.buy_info['quantity']}주, 실제: {actual_quantity}주")
-                        logger.warning(f"⚠️ 수동 매수를 포함하여 전량 매도합니다.")
-
-                    # 평균 매입단가가 다르면 경고 (수동 매수로 평균단가 변경)
-                    if actual_buy_price != self.buy_info["buy_price"]:
-                        logger.warning(f"⚠️ 평균 매입단가가 기록과 다릅니다! 기록: {self.buy_info['buy_price']:,}원, 실제: {actual_buy_price:,}원")
-                        logger.warning(f"⚠️ 실제 평균 매입단가 기준으로 수익률을 재계산합니다.")
-
-                        # 수익률 재계산
-                        profit_rate = (current_price - actual_buy_price) / actual_buy_price
-                        logger.info(f"📊 재계산된 수익률: {profit_rate*100:+.2f}%")
-                    break
-            else:
-                logger.warning(f"⚠️ 계좌에서 종목을 찾을 수 없습니다. 기록된 정보로 매도합니다.")
-        else:
-            logger.warning(f"⚠️ 계좌 잔고 조회 실패. 기록된 정보로 매도합니다.")
+        logger.info(f"💰 매도 수량: {actual_quantity}주 (캐시 기반 100% 전량)")
+        logger.info(f"💰 평균 매입단가: {actual_buy_price:,}원 (캐시 기반)")
 
         # 매도 수량이 0이면 중단
         if actual_quantity <= 0:
             logger.error("❌ 매도할 수량이 0입니다. 매도를 중단합니다.")
             return
-
-        logger.info(f"💰 매도 수량: {actual_quantity}주 (100% 전량)")
 
         # 매도가 계산 (현재가에서 한 틱 아래)
         sell_price = calculate_sell_price(current_price)
@@ -772,35 +917,17 @@ class AutoTradingSystem:
         logger.info(f"손실률: {profit_rate*100:.2f}%")
         logger.info("=" * 60)
 
-        # 실제 보유 수량 조회 (100% 전량 매도를 위해)
-        logger.info("📊 계좌 잔고에서 실제 보유 수량을 조회합니다...")
-        balance_result = self.kiwoom_api.get_account_balance()
+        # 캐시된 보유 정보 사용 (180ms 절약, 수동 매수 시 재시작 필요)
+        actual_quantity = self.buy_info["quantity"]
+        actual_buy_price = self.buy_info["buy_price"]
 
-        actual_quantity = self.buy_info["quantity"]  # 기본값
-        actual_buy_price = self.buy_info["buy_price"]  # 기본값
-
-        if balance_result.get("success"):
-            holdings = balance_result.get("holdings", [])
-            for holding in holdings:
-                if holding.get("stk_cd") == self.buy_info["stock_code"]:
-                    actual_quantity = int(holding.get("rmnd_qty") or 0)
-                    actual_buy_price = int(holding.get("buy_uv") or 0)
-
-                    logger.info(f"✅ 실제 보유 수량 확인: {actual_quantity}주")
-                    logger.info(f"✅ 평균 매입단가: {actual_buy_price:,}원")
-
-                    # 평균 매입단가가 다르면 손실률 재계산
-                    if actual_buy_price != self.buy_info["buy_price"]:
-                        profit_rate = (current_price - actual_buy_price) / actual_buy_price
-                        logger.info(f"📊 재계산된 손실률: {profit_rate*100:+.2f}%")
-                    break
+        logger.info(f"💰 손절 수량: {actual_quantity}주 (캐시 기반 100% 전량)")
+        logger.info(f"💰 평균 매입단가: {actual_buy_price:,}원 (캐시 기반)")
 
         # 매도 수량이 0이면 중단
         if actual_quantity <= 0:
             logger.error("❌ 매도할 수량이 0입니다. 손절을 중단합니다.")
             return
-
-        logger.info(f"💰 손절 매도 수량: {actual_quantity}주 (100% 전량 시장가)")
 
         try:
             # 시장가 매도 주문 (즉시 체결)
@@ -856,7 +983,7 @@ class AutoTradingSystem:
                 for order in outstanding_orders:
                     order_no = order.get("ord_no", "")
                     stock_code = order.get("stk_cd", "")
-                    remaining_qty = int(order.get("rmndr_qty", order.get("ord_qty", "0")))
+                    remaining_qty = int(order.get("rmnd_qty", order.get("ord_qty", "0")))
 
                     logger.info(f"  ❌ 미체결 주문 취소 중: 주문번호={order_no}, 종목={stock_code}, 수량={remaining_qty}주")
 
@@ -879,30 +1006,12 @@ class AutoTradingSystem:
 
         logger.info("=" * 80)
 
-        # 실제 보유 수량 및 평균 매입단가 조회
-        logger.info("📊 계좌 잔고에서 실제 보유 수량을 조회합니다...")
-        balance_result = self.kiwoom_api.get_account_balance()
+        # 캐시된 보유 정보 사용 (180ms 절약, 수동 매수 시 재시작 필요)
+        actual_quantity = self.buy_info["quantity"]
+        actual_buy_price = self.buy_info["buy_price"]
 
-        actual_quantity = self.buy_info["quantity"]  # 기본값
-        actual_buy_price = self.buy_info["buy_price"]  # 기본값
-
-        if balance_result.get("success"):
-            holdings = balance_result.get("holdings", [])
-            # 해당 종목 찾기
-            for holding in holdings:
-                if holding.get("stock_code") == self.buy_info["stock_code"]:
-                    actual_quantity = holding.get("quantity", self.buy_info["quantity"])
-                    actual_buy_price = holding.get("avg_price", self.buy_info["buy_price"])
-                    logger.info(f"✅ 실제 보유 정보 확인:")
-                    logger.info(f"   보유 수량: {actual_quantity}주")
-                    logger.info(f"   평균 매입단가: {actual_buy_price:,}원")
-                    break
-            else:
-                logger.warning(f"⚠️ 계좌 잔고에서 종목을 찾을 수 없습니다. 기본값 사용 (수량: {actual_quantity}주)")
-        else:
-            logger.warning(f"⚠️ 계좌 잔고 조회 실패. 기본값 사용 (수량: {actual_quantity}주)")
-
-        logger.info(f"💰 강제 청산 수량: {actual_quantity}주 (100% 전량 시장가)")
+        logger.info(f"💰 강제 청산 수량: {actual_quantity}주 (캐시 기반 100% 전량)")
+        logger.info(f"💰 평균 매입단가: {actual_buy_price:,}원 (캐시 기반)")
 
         try:
             # 시장가 매도 주문
