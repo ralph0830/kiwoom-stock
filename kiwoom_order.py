@@ -798,26 +798,25 @@ class KiwoomOrderAPI:
         max_investment: int = 1000000
     ) -> int:
         """
-        매수 수량 계산 (안전 마진 2% 적용)
+        매수 수량 계산 (100% 투자)
 
-        시장가 매수 시 체결가가 현재가보다 높을 수 있으므로
-        2% 여유를 두고 계산하여 예수금 부족을 방지합니다.
+        증거금 부족 시 API가 매수 가능 수량을 자동으로 알려주므로
+        100% 투자금을 사용합니다. (자동 재시도 로직으로 안전하게 처리)
 
         Args:
             buy_price: 매수가격 (현재가)
             max_investment: 최대 투자금액 (기본: 100만원)
 
         Returns:
-            매수 가능 수량 (안전 마진 2% 적용)
+            매수 가능 수량 (100% 투자)
         """
         if buy_price <= 0:
             return 0
 
-        # 안전 마진 2% 적용 (시장가 체결가 변동 + 수수료 고려)
-        safe_investment = int(max_investment * 0.98)
-        quantity = safe_investment // buy_price
+        # 100% 투자 (증거금 부족 시 API가 자동으로 가능 수량 알려줌)
+        quantity = max_investment // buy_price
 
-        logger.info(f"💰 매수 수량 계산: 투자금 {max_investment:,}원 (안전금액: {safe_investment:,}원) / 현재가 {buy_price:,}원 = {quantity}주")
+        logger.info(f"💰 매수 수량 계산: 투자금 {max_investment:,}원 / 현재가 {buy_price:,}원 = {quantity}주")
 
         return quantity
 

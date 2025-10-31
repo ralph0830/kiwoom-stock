@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# 환경 변수 (API 키 포함 - 절대 커밋 금지)
+.env
+
 # 수집된 종목 데이터
 stock_data/
 
