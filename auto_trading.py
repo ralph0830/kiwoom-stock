@@ -102,6 +102,7 @@ class AutoTradingSystem:
             "stock_name": None,
             "buy_price": 0,
             "quantity": 0,
+            "buy_time": None,  # 매수 시간 (손절 지연용)
             "target_profit_rate": target_profit_rate  # 환경변수에서 읽어온 목표 수익률
         }
 
@@ -140,8 +141,15 @@ class AutoTradingSystem:
         stop_loss_rate_percent = float(os.getenv("STOP_LOSS_RATE", "-2.5"))
         self.stop_loss_rate = stop_loss_rate_percent / 100  # 퍼센트를 소수로 변환
 
+        # 손절 지연 시간 환경변수에서 읽기 (기본값: 1분)
+        self.stop_loss_delay_minutes = int(os.getenv("STOP_LOSS_DELAY_MINUTES", "1"))
+
         if self.enable_stop_loss:
             logger.info(f"🛡️  손절 모니터링 활성화: {stop_loss_rate_percent}% 이하 시 시장가 매도")
+            if self.stop_loss_delay_minutes > 0:
+                logger.info(f"⏱️  손절 지연 설정: 매수 후 {self.stop_loss_delay_minutes}분 이후부터 손절 가능")
+            else:
+                logger.info("⏱️  손절 지연 없음: 즉시 손절 가능")
         else:
             logger.info("⏸️  손절 모니터링이 비활성화되었습니다 (ENABLE_STOP_LOSS=false)")
 
@@ -206,7 +214,7 @@ class AutoTradingSystem:
             logger.error(f"매수 이력 확인 중 오류: {e}")
             return False
 
-    def record_today_trading(self, stock_code: str, stock_name: str, buy_price: int, quantity: int):
+    def record_today_trading(self, stock_code: str, stock_name: str, buy_price: int, quantity: int, buy_time: datetime = None):
         """
         오늘 매수 기록 저장
 
@@ -215,21 +223,26 @@ class AutoTradingSystem:
             stock_name: 종목명
             buy_price: 매수가
             quantity: 매수 수량
+            buy_time: 매수 시간 (선택적, 자동 매수만 전달)
         """
         try:
             lock_data = {
                 "last_trading_date": datetime.now().strftime("%Y%m%d"),
-                "trading_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "stock_code": stock_code,
                 "stock_name": stock_name,
                 "buy_price": buy_price,
                 "quantity": quantity
             }
 
+            # buy_time이 있을 때만 trading_time 필드 추가 (자동 매수만)
+            if buy_time is not None:
+                lock_data["trading_time"] = buy_time.strftime("%Y-%m-%d %H:%M:%S")
+                logger.info(f"✅ 오늘 매수 기록 저장 완료 (매수 시간: {lock_data['trading_time']})")
+            else:
+                logger.info(f"✅ 오늘 매수 기록 저장 완료 (수동 매수 - 손절 지연 없음)")
+
             with open(self.trading_lock_file, 'w', encoding='utf-8') as f:
                 json.dump(lock_data, f, ensure_ascii=False, indent=2)
-
-            logger.info(f"✅ 오늘 매수 기록 저장 완료")
 
         except Exception as e:
             logger.error(f"매수 기록 저장 중 오류: {e}")
@@ -264,8 +277,24 @@ class AutoTradingSystem:
                 "stock_name": first_holding.get("stk_nm", ""),
                 "buy_price": int(first_holding.get("buy_uv", 0)),
                 "quantity": int(first_holding.get("rmnd_qty", 0)),  # 보유수량 (rmnd_qty)
-                "current_price": int(first_holding.get("cur_prc", 0))  # 현재가 (cur_prc)
+                "current_price": int(first_holding.get("cur_prc", 0)),  # 현재가 (cur_prc)
+                "buy_time": None  # 기본값
             }
+
+            # daily_trading_lock.json에서 매수 시간 로드 시도
+            if self.trading_lock_file.exists():
+                try:
+                    with open(self.trading_lock_file, 'r', encoding='utf-8') as f:
+                        lock_data = json.load(f)
+
+                    # trading_time을 datetime 객체로 변환
+                    trading_time_str = lock_data.get("trading_time")
+                    if trading_time_str:
+                        trading_info["buy_time"] = datetime.strptime(trading_time_str, "%Y-%m-%d %H:%M:%S")
+                        logger.info(f"📅 매수 시간: {trading_time_str}")
+
+                except Exception as e:
+                    logger.warning(f"⚠️ 매수 시간 로드 실패: {e}")
 
             logger.info("=" * 60)
             logger.info("📥 실제 계좌 보유 종목 확인")
@@ -445,11 +474,13 @@ class AutoTradingSystem:
             )
 
             # 매수 정보 저장 (추정값 또는 개선 모드용 초기값)
+            buy_time = datetime.now()  # 매수 시간 기록
             self.buy_info = {
                 "stock_code": stock_code,
                 "stock_name": stock_name,
                 "buy_price": current_price,  # 추정값 (시장가 주문 시점 현재가)
                 "quantity": quantity,         # 추정값
+                "buy_time": buy_time,         # 매수 시간
                 "target_profit_rate": self.buy_info["target_profit_rate"],
                 "is_verified": not self.enable_lazy_verification  # 개선 모드면 False (자동 검증 필요)
             }
@@ -611,7 +642,8 @@ class AutoTradingSystem:
                                     stock_code=stock_code,
                                     stock_name=self.buy_info["stock_name"],
                                     buy_price=actual_price,
-                                    quantity=actual_quantity
+                                    quantity=actual_quantity,
+                                    buy_time=self.buy_info.get("buy_time")
                                 )
 
                                 logger.info("✅ 실제 체결 정보 확인 완료!")
@@ -671,7 +703,8 @@ class AutoTradingSystem:
                                         stock_code=stock_code,
                                         stock_name=self.buy_info["stock_name"],
                                         buy_price=actual_buy_price,
-                                        quantity=actual_quantity
+                                        quantity=actual_quantity,
+                                        buy_time=self.buy_info.get("buy_time")
                                     )
 
                                     logger.warning("=" * 80)
@@ -712,6 +745,16 @@ class AutoTradingSystem:
 
         # 손절 조건 체크 (손절이 목표 수익률보다 우선)
         if self.enable_stop_loss and profit_rate <= self.stop_loss_rate and not self.sell_executed:
+            # 매수 후 경과 시간 체크 (손절 지연 설정)
+            buy_time = self.buy_info.get("buy_time")
+            if buy_time and self.stop_loss_delay_minutes > 0:
+                elapsed_minutes = (datetime.now() - buy_time).total_seconds() / 60
+                if elapsed_minutes < self.stop_loss_delay_minutes:
+                    # 손절 지연 시간 이내면 손절하지 않음
+                    if self.debug_mode:
+                        logger.debug(f"⏱️  손절 지연: 매수 후 {elapsed_minutes:.1f}분 경과 (설정: {self.stop_loss_delay_minutes}분 이후부터 손절)")
+                    return
+
             # 캐시된 평균단가로 즉시 손절 실행 (180ms 절약)
             await self.execute_stop_loss(current_price, profit_rate)
             return
@@ -1323,18 +1366,16 @@ class AutoTradingSystem:
                             logger.info("✅ 자동 매수 완료!")
                             self.order_executed = True
 
-                            # 매수 정보 저장 (매도 모니터링용)
-                            self.buy_info["stock_code"] = stock_data.get("종목코드")
-                            self.buy_info["stock_name"] = stock_data.get("종목명")
-                            self.buy_info["buy_price"] = parse_price_string(stock_data.get("현재가", "0"))
-                            self.buy_info["quantity"] = order_result.get("quantity", 0)
+                            # 매수 정보는 execute_auto_buy()에서 이미 설정됨
+                            # buy_time도 이미 기록되어 있음
 
                             # 오늘 매수 기록 저장 (하루 1회 제한)
                             self.record_today_trading(
                                 stock_code=self.buy_info["stock_code"],
                                 stock_name=self.buy_info["stock_name"],
                                 buy_price=self.buy_info["buy_price"],
-                                quantity=self.buy_info["quantity"]
+                                quantity=self.buy_info["quantity"],
+                                buy_time=self.buy_info.get("buy_time")  # 매수 시간 전달
                             )
 
                             # WebSocket 실시간 시세 모니터링 시작 (환경변수 확인)
@@ -1385,6 +1426,7 @@ class AutoTradingSystem:
                 self.buy_info["stock_name"] = trading_info.get("stock_name")
                 self.buy_info["buy_price"] = trading_info.get("buy_price", 0)
                 self.buy_info["quantity"] = trading_info.get("quantity", 0)
+                self.buy_info["buy_time"] = trading_info.get("buy_time")  # 매수 시간 복원
 
                 logger.info("=" * 60)
                 logger.info(f"📥 매수 정보 복원 완료")

@@ -104,6 +104,11 @@ STOP_LOSS_RATE=-2.5          # 손절 수익률 (%) - 기본값: -2.5%
 ENABLE_DAILY_FORCE_SELL=true # 일일 강제 청산 활성화 (true: 활성화, false: 비활성화)
 DAILY_FORCE_SELL_TIME=15:19  # 강제 청산 시간 (기본값: 15:19 - 장마감 11분 전)
 
+# 미체결 주문 처리 설정 (v1.2.0)
+CANCEL_OUTSTANDING_ON_FAILURE=true   # 미체결 시 주문 취소 여부 (true: 취소 후 재모니터링, false: 주문 유지하고 재모니터링)
+OUTSTANDING_CHECK_TIMEOUT=30         # 체결 확인 타임아웃 (초) - 기본값: 30초
+OUTSTANDING_CHECK_INTERVAL=5         # 체결 확인 주기 (초) - 기본값: 5초
+
 # 실시간 체결 정보 검증 설정 (v1.3.0)
 ENABLE_LAZY_VERIFICATION=false  # 실시간 체결 정보 자동 검증 (true: 개선 모드, false: 기존 모드)
 ```
@@ -180,6 +185,8 @@ stock/
 - `execute_stop_loss()`: 손절 수익률 도달 시 자동 손절 (100% 전량 시장가 매도)
 - `execute_daily_force_sell()`: 일일 강제 청산 실행 (100% 전량 시장가 매도)
 - `is_force_sell_time()`: 강제 청산 시간 도달 여부 확인
+- `wait_for_sell_execution()`: 매도 체결 대기 및 확인 (5초 간격, 최대 30초)
+- `handle_outstanding_order()`: 미체결 주문 처리 (취소 또는 유지)
 - `price_polling_loop()`: REST API로 1분마다 현재가 조회 (백업)
 - `load_today_trading_info()`: 계좌 잔고에서 매수 정보 복원
 - `cleanup()`: 리소스 정리 (WebSocket, 브라우저 종료)
@@ -203,7 +210,10 @@ REST API를 통한 주문 실행 및 인증 담당
 - `place_market_buy_order()`: 시장가 매수 주문
 - `place_limit_buy_order()`: 지정가 매수 주문
 - `place_limit_sell_order()`: 지정가 매도 주문 (익절용)
-- `place_market_sell_order()`: 시장가 매도 주문 (손절용)
+- `place_market_sell_order()`: 시장가 매도 주문 (손절/강제청산용)
+- `get_outstanding_orders()`: 미체결 주문 조회 (ka10075)
+- `cancel_order()`: 미체결 주문 취소 (kt10003)
+- `check_order_execution()`: 주문 체결 여부 확인
 - `get_current_price()`: 현재가 조회 (REST API)
 - `get_account_balance()`: 계좌 잔고 및 보유종목 조회
 - `calculate_order_quantity()`: 최대 투자금액 기준 매수 수량 계산
@@ -254,8 +264,9 @@ WebSocket을 통한 실시간 시세 수신 및 연결 관리
 - `POST /api/dostk/ordr`: 주문 실행 (매수/매도)
   - `kt10000`: 주식 매수주문
   - `kt10001`: 주식 매도주문
+  - `kt10003`: 주문 취소
 - `POST /api/dostk/stkinfo`: 주식 현재가 조회 (ka10001)
-- `POST /api/dostk/acnt`: 계좌 잔고 조회 (ka01690)
+- `POST /api/dostk/acnt`: 계좌 잔고 조회 (ka01690), 미체결 주문 조회 (ka10075)
 
 #### WebSocket
 - **URL (실전)**: `wss://api.kiwoom.com:10000/api/dostk/websocket`
@@ -290,7 +301,11 @@ WebSocket을 통한 실시간 시세 수신 및 연결 관리
 4. 계좌 잔고에서 실제 보유 수량 및 평균 매입단가 조회
 5. 매도가 계산: `목표가 - 1틱`
 6. REST API로 지정가 매도 주문 실행 (100% 전량)
-7. 매도 결과를 `trading_results/` 디렉토리에 저장
+7. 체결 확인 대기 (5초 간격, 최대 30초)
+8. 미체결 시 설정에 따라 처리:
+   - `CANCEL_OUTSTANDING_ON_FAILURE=true`: 주문 취소 후 재모니터링
+   - `CANCEL_OUTSTANDING_ON_FAILURE=false`: 주문 유지하고 재모니터링
+9. 체결 완료 시 매도 결과를 `trading_results/` 디렉토리에 저장
 
 #### 손절 플로우
 1. WebSocket 실시간 시세 수신 (콜백: `on_price_update()`)
@@ -304,10 +319,11 @@ WebSocket을 통한 실시간 시세 수신 및 연결 관리
 1. WebSocket 실시간 시세 수신 (콜백: `on_price_update()`)
 2. 현재 시간 확인 및 강제 청산 시간 도달 체크 (환경변수 `DAILY_FORCE_SELL_TIME`, 기본값: 15:19)
 3. 강제 청산 시간 도달 시 즉시 실행 (수익/손실 관계없이)
-4. 계좌 잔고에서 실제 보유 수량 및 평균 매입단가 조회
-5. REST API로 시장가 매도 주문 실행 (100% 전량 즉시 체결)
-6. 현재가 조회 후 수익률 계산
-7. 강제 청산 결과를 `trading_results/` 디렉토리에 저장
+4. **모든 미체결 주문 자동 취소** (안전장치)
+5. 계좌 잔고에서 실제 보유 수량 및 평균 매입단가 조회
+6. REST API로 시장가 매도 주문 실행 (100% 전량 즉시 체결)
+7. 현재가 조회 후 수익률 계산
+8. 강제 청산 결과를 `trading_results/` 디렉토리에 저장
 
 **우선순위**: 강제 청산 > 손절 > 익절 (시간 도달 시 무조건 강제 청산 실행)
 
@@ -426,7 +442,12 @@ self.sell_executed = True  # 즉시 플래그 설정
 # 매도 주문 실행
 ```
 
-**3. 빈 계좌 잔고 처리**:
+**3. 미체결 주문 관리 (v1.2.0)**:
+- 매도 주문 후 체결 확인 (5초 간격, 최대 30초)
+- 미체결 시 설정에 따라 자동 취소 또는 주문 유지
+- 강제 청산 전 모든 미체결 주문 자동 취소
+
+**4. 빈 계좌 잔고 처리**:
 - API 응답에서 빈 딕셔너리 필터링
 - 종목코드가 없는 항목 제외
 - 안전한 타입 변환 (`int(value or 0)`)
@@ -623,6 +644,14 @@ __pycache__/
 - **현상**: 추정값 기준으로는 목표 도달했지만 실제값으로는 미달
 - **원인**: 시장가 체결가가 현재가보다 높음 (평균 0.5~1% 차이)
 - **해결**: 필요시 `ENABLE_LAZY_VERIFICATION=false`로 변경하여 빠른 대응 우선
+
+### 지정가 매도 주문이 미체결되어도 시스템 종료 (v1.2.0 이전)
+- **원인**: 매도 주문 접수 즉시 완료 처리
+- **해결**: 체결 확인 로직 추가 (5초 간격, 최대 30초), 미체결 시 취소 또는 유지 선택 가능
+
+### 강제 청산 시 미체결 주문 잔존 (v1.2.0 이전)
+- **원인**: 강제 청산 전 미체결 주문 확인 없음
+- **해결**: 15:19 도달 시 모든 미체결 주문 자동 취소 후 시장가 매도
 
 ## Testing
 
